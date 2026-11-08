@@ -51,10 +51,14 @@ def batch_stats(per: list[dict]) -> dict:
     mean = sum(scores) / len(scores)
     std = 0.0 if len(scores) == 1 else \
         (sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5
-    return {"num_envs": len(per), "successes": int(n),
-            "success_rate": round(n / len(per), 4),
-            "score_mean": round(mean, 4), "score_std": round(std, 4),
-            "score_min": round(min(scores), 4), "score_max": round(max(scores), 4)}
+    out = {"num_envs": len(per), "successes": int(n),
+           "success_rate": round(n / len(per), 4),
+           "score_mean": round(mean, 4), "score_std": round(std, 4),
+           "score_min": round(min(scores), 4), "score_max": round(max(scores), 4)}
+    if all("safety" in v for v in per):
+        safe = sum(v["safety"]["safe"] for v in per)
+        out.update(safe=int(safe), safe_rate=round(safe / len(per), 4))
+    return out
 
 
 def load_solve(path: str):
@@ -150,6 +154,12 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=OUT, help="rollout artifact directory")
     ap.add_argument("--render", action="store_true",
                     help="render the run: /out/frames/*.jpg + frames.jsonl + render.json")
+    ap.add_argument("--safety", choices=("off", "monitor", "enforce"), default="off",
+                    help="safety layer (robobench/core/safety.py): 'monitor' reports rated-limit and "
+                         "task-rule violations per trajectory; 'enforce' also clamps commands and "
+                         "trips a software e-stop on the first violation")
+    ap.add_argument("--safety-gate", action="store_true",
+                    help="an unsafe trajectory is not a success (its progress score is kept)")
     ap.add_argument("--cameras", action="store_true",
                     help="enable cameras WITHOUT the per-step video renderer: what a grader's "
                          "final-frame VLM gate needs (omni.replicator only exists with cameras on); "
@@ -229,10 +239,18 @@ def main() -> None:
         if stop["flag"]:
             raise TimeoutError("grading budget reached")
 
-    genv = GradedEnv(env, grader, on_record=on_record)
+    shield = None
+    if args.safety != "off":
+        from robobench.core.safety import install_safety
+
+        # rules belong to the real scene (a cfg-only variant like slice_banana uses "slice")
+        shield = install_safety(env, scene=env_cfg.scene, mode=args.safety)
+    genv = GradedEnv(env, grader, on_record=on_record, safety=shield, safety_gate=args.safety_gate)
 
     result = {"preset": args.preset, "scene": args.scene, "seed": args.seed,
               "num_envs": E, "criteria": grader.describe()}
+    if shield is not None:
+        result["safety"] = {**shield.describe(), "gate": args.safety_gate}
 
     def finalize() -> None:
         """Each traj folder gets its verdict.json; the meta result gets the
@@ -247,6 +265,7 @@ def main() -> None:
                 # final-stage audit (VLM gate image path, prompt, raw answer) when the
                 # grader has one — absent otherwise
                 **({"final": v["final"]} if "final" in v else {}),
+                **({"safety": v["safety"]} if "safety" in v else {}),
             }, indent=2) + "\n")
         s = batch_stats(per)
         result.update(success=s["success_rate"], score=s["score_mean"],

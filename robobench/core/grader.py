@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     import torch
@@ -231,17 +231,25 @@ class GradedEnv:
 
     Same surface — every attribute delegates to the wrapped env — except:
     step() also records the grader's rubric, and the grading-time shortcuts,
-    reset and set_states, are blocked. The harness keeps the raw env."""
+    reset and set_states, are blocked. The harness keeps the raw env.
+
+    Optional `safety` (a `SafetyShield`, see safety.py): each verdict gains a
+    "safety" report, the shield's hooks are checked every step, and with
+    `safety_gate` an unsafe trajectory is not a success."""
 
     def __init__(self, env: BaseEnv, grader: BaseGrader,
-                 on_record: Callable[[list[dict]], None] | None = None) -> None:
+                 on_record: Callable[[list[dict]], None] | None = None,
+                 safety: Any = None, safety_gate: bool = False) -> None:
         self._env, self._grader, self._on_record = env, grader, on_record
+        self._safety, self._safety_gate = safety, safety_gate
 
     def __getattr__(self, name):
         return getattr(self._env, name)
 
     def step(self, action, render: bool = False):
         out = self._env.step(action, render)
+        if self._safety is not None:
+            self._safety.intact()  # flags removed hooks / a swapped robot in the report
         recs = self._grader.record()  # one record per trajectory
         if self._on_record is not None:
             self._on_record(recs)
@@ -256,4 +264,7 @@ class GradedEnv:
 
     def verdict(self) -> list[dict]:
         """Per-trajectory verdicts — aggregation is the caller's job."""
-        return self._grader.verdict()
+        verdicts = self._grader.verdict()
+        if self._safety is not None:
+            verdicts = self._safety.merge(verdicts, gate=self._safety_gate)
+        return verdicts

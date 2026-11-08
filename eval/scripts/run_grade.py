@@ -60,7 +60,8 @@ def grade_one(*, args, exp: Path, stage: Path, preset: str, scene: str, grader_d
         DEFAULT_IMAGE, "python", "/grader/grade.py",
         "--preset", preset, "--scene", scene, "--seed", str(args.seed),
         "--num-envs", str(args.num_envs),
-    ] + (["--render"] if args.render else [])
+        "--safety", args.safety,
+    ] + (["--render"] if args.render else []) + (["--safety-gate"] if args.safety_gate else [])
 
     if args.dry_run:
         import shlex
@@ -172,6 +173,10 @@ def main() -> None:
     ap.add_argument("--budget-min", type=float, default=30, help="wall-clock kill budget PER GRADE (minutes)")
     ap.add_argument("--render", action="store_true",
                     help="render the run: <out>/frames/*.jpg + frames.jsonl + render.json")
+    ap.add_argument("--safety", choices=("off", "monitor", "enforce"), default="off",
+                    help="safety layer in the grading container (robobench/core/safety.py)")
+    ap.add_argument("--safety-gate", action="store_true",
+                    help="an unsafe trajectory is not a success")
     ap.add_argument("--dry-run", action="store_true", help="print the docker command(s) and exit")
     args = ap.parse_args()
 
