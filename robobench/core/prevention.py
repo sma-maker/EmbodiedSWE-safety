@@ -16,6 +16,8 @@ solution AVOID it in the first place. Two kinds of tools:
     HoldMonitor       a held object slipping in the hand (knife, box, wheel) — boosts the grip
     TurnMonitor       a part turned by hand spinning in the fingers (nut, bulb) — boosts the grip
     FixtureGuard      drawers and lids: a 0..1 scale to slow the pull before it slams
+    FixtureMove       one drawer / lid / door toward a target: slows before its end stop,
+                      reports "straining" (pulling hard, not moving) — with AddedEffort
     PourGuard         pour only with the receiving cup under the spout (latte, coffee)
     AimGuard          dispense only when the nozzle does not point at the robot (syringe)
     KnifeGuard        cut only over the food, and not through the board
@@ -618,6 +620,114 @@ class FixtureGuard:
         return torch.clamp((self.speed_max - self.speed()) / (0.3 * self.speed_max), 0.0, 1.0)
 
 
+class AddedEffort:
+    """"Pushing hard", measured as torque ADDED since `rebase()` (over `ratio` of a joint's rating,
+    any arm joint). The load of holding the arm and its payload up is about constant over a short
+    task step, so only the rise means pushing on something. `rebase()` when the step starts."""
+
+    def __init__(self, env: BaseEnv, ratio: float = 0.25) -> None:
+        self.env, self.ratio = env, ratio
+        self._arms = _guards(env)
+        self._base = [None] * len(self._arms)
+        self.rebase()
+
+    @staticmethod
+    def _tau(g):
+        tau = getattr(g.art.data, "applied_torque", None)
+        return None if tau is None else tau.abs().clone()
+
+    def rebase(self) -> None:
+        self._base = [self._tau(g) for g in self._arms]
+
+    def hard(self) -> torch.Tensor:
+        import torch
+
+        out = torch.zeros(self.env.num_envs, dtype=torch.bool)
+        for g, base in zip(self._arms, self._base):
+            tau = self._tau(g)
+            if tau is None or base is None:
+                continue
+            extra = torch.where(g.grip, torch.zeros_like(tau), (tau - base) / g.rated_eff)
+            out = out.to(extra.device) | (extra > self.ratio).any(dim=1)
+        return out
+
+
+class FixtureMove:
+    """Moving one fixture joint (a drawer slide, a lid or door hinge) toward `target`, gently.
+
+    `scale()` is a 0..1 multiplier for the pull/push command: 1 while the joint moves under 70% of
+    the speed it is allowed, falling to 0 at that speed. The allowed speed is `speed_max`, and only
+    `stop_speed` within `slow_zone` of the hard stop it is heading for — so it never slams into
+    its end stop (or shut). Status per env:
+
+      "done"       within `tol` of the target — stop pulling/pushing
+      "too_fast"   over `speed_max` right now — back off (scale() is 0)
+      "straining"  pushing hard (`effort`, if given) and the joint is not moving — something is
+                   stuck or it is already against a stop: stop, don't pull harder
+      "moving"     keep going (with `scale()` applied)
+    """
+
+    def __init__(self, env: BaseEnv, art, joint: int, target: float, limits: tuple[float, float],
+                 speed_max: float, slow_zone: float, stop_speed: float, tol: float,
+                 effort: AddedEffort | None = None, window_s: float = 0.5,
+                 min_progress: float | None = None) -> None:
+        import torch
+
+        self.env, self.art, self.j, self.target = env, art, joint, target
+        self.lo, self.hi = limits
+        self.speed_max, self.slow_zone, self.stop_speed, self.tol = speed_max, slow_zone, stop_speed, tol
+        self.effort = effort
+        if effort is not None:
+            effort.rebase()
+        self.min_progress = min_progress if min_progress is not None else 0.1 * slow_zone
+        self._window = deque(maxlen=max(2, round(window_s / env.dt)))
+        self.straining = torch.zeros(env.num_envs, dtype=torch.bool, device=art.data.joint_pos.device)
+        add_post_step(env, self._update)
+
+    def pos(self) -> torch.Tensor:
+        return self.art.data.joint_pos[:, self.j]
+
+    def vel(self) -> torch.Tensor:
+        return self.art.data.joint_vel[:, self.j]
+
+    def allowed_speed(self) -> torch.Tensor:
+        """(n,) speed allowed now: `stop_speed` near the stop the joint is heading for."""
+        import torch
+
+        q, v = self.pos(), self.vel()
+        to_stop = torch.where(v >= 0, self.hi - q, q - self.lo)
+        near = to_stop <= self.slow_zone
+        return torch.where(near, torch.full_like(q, self.stop_speed), torch.full_like(q, self.speed_max))
+
+    def scale(self) -> torch.Tensor:
+        import torch
+
+        lim = self.allowed_speed()
+        return torch.clamp((lim - self.vel().abs()) / (0.3 * lim), 0.0, 1.0)
+
+    def _update(self) -> None:
+        q = self.pos()
+        self._window.append(q.clone())
+        if self.effort is not None and len(self._window) == self._window.maxlen:
+            moved = (self._window[-1] - self._window[0]).abs()
+            self.straining |= (moved < self.min_progress) & self.effort.hard().to(moved.device) & ~self.done()
+
+    def done(self) -> torch.Tensor:
+        return (self.pos() - self.target).abs() <= self.tol
+
+    def status(self) -> list[str]:
+        done, fast = self.done(), self.vel().abs() > self.speed_max
+        return ["done" if bool(done[e]) else "too_fast" if bool(fast[e])
+                else "straining" if bool(self.straining[e]) else "moving"
+                for e in range(self.env.num_envs)]
+
+    def should_stop(self) -> list[bool]:
+        return [s != "moving" for s in self.status()]
+
+    def close(self) -> None:
+        remove_post_step(self.env, self._update)
+
+
 class PourGuard:
     """Pour only when the receiving container is under the spout: spout (the `source` object's
     origin plus `spout_offset` in its own frame) within `radius` of the `target` horizontally and at
@@ -767,7 +877,7 @@ def _p(scene, grip=None, grip_max=None, ee_speed=None, *steps):
 
 PREVENTION: dict[str, TaskPrevention] = {p.scene: p for p in [
     # Assembly (Franka / xArm7 / Gen3: grip in N)
-    # allen_bolt, bulb, ikea_table, so101 and nut_thread have dedicated modules; prefer them over these generic plans.
+    # all 28 tasks of the review have dedicated modules; prefer them over these generic plans.
     _p("allen_bolt", 30.0, 60.0, 0.5,
        "prefer robobench.suites.assembly.prevention.allen_bolt.AllenBoltPrevention (grip from the "
        "parts' physics, lift test, release gate, key-in-socket and drive checks)",
@@ -798,70 +908,116 @@ PREVENTION: dict[str, TaskPrevention] = {p.scene: p for p in [
        "ok, info = prev.aligned('nut_0', bolt_tip_xyz, target_axis=(0, 0, 1)); verify before turning",
        "ins = prev.insertion('nut_0', axis=(0, 0, -1), seat_depth); unwind on 'stalled'"),
     _p("pc_gpu", 15.0, 25.0, 0.2,
+       "prefer robobench.suites.assembly.prevention.pc_gpu.PcGpuPrevention (slot check, staff "
+       "sign-off before pressing, PressMonitor that stops on unverified / off_slot / shoving, and "
+       "a watchdog that reports shove attempts to the safety layer)",
        "ok, info = prev.aligned('card', slot_xyz, target_axis=slot_axis); "
        "prev.verify_then_approve('slot_alignment_verified', ok, info)",
        "ins = prev.insertion('card', axis=(0, 0, -1), seat_depth); lift and re-align on 'stalled'"),
     _p("pc_gpu_ram", 15.0, 25.0, 0.2,
+       "prefer robobench.suites.assembly.prevention.pc_gpu_ram.PcGpuRamPrevention (staff confirm "
+       "each part's slot before aligning, robot alignment check incl. wrong-slot detection, "
+       "PressMonitor, shove watchdog)",
        "verify each card/module with prev.aligned + verify_then_approve('slot_alignment_verified')",
        "press each in with prev.insertion; never push through a 'stalled'"),
     _p("pc_motherboard", 20.0, 30.0, 0.2,
+       "prefer robobench.suites.assembly.prevention.pc_motherboard.PcMotherboardPrevention (verify "
+       "all bolt positions with staff before driving, key-in-socket check, DriveMonitor, watchdog "
+       "for the key tip on the board and for unverified driving)",
        "before each bolt: ok, info = prev.aligned('key', hole_xyz, target_axis=(0, 0, -1)); "
        "prev.verify_then_approve('bolt_positions_verified', ok, info)",
        "drive with prev.insertion on the key; stop on 'stalled'"),
     _p("pc_ram", 15.0, 25.0, 0.2,
+       "prefer robobench.suites.assembly.prevention.pc_ram.PcRamPrevention (robot check with "
+       "wrong-slot detection, PressMonitor, shove watchdog; no staff step)",
        "verify each module with prev.aligned + verify_then_approve('slot_alignment_verified')",
        "press in with prev.insertion; re-align on 'stalled'"),
     # Organizing
     _p("pen_holder", 10.0, 20.0, 0.3,
+       "prefer robobench.suites.packing.prevention.pen_holder.PenHolderPrevention (robot check + "
+       "staff sign-off that each pen is tip-up, watchdog for tip-down inserts and tips pressed on "
+       "the table, slow insertion)",
        "before inserting: prev.upright(pen) and prev.verify_then_approve('pen_orientation_verified', ok)",
        _PLACE.format(obj="<pen>")),
     _p("tool_packing", 20.0, 30.0, 0.3,
+       "prefer robobench.suites.packing.prevention.tool_packing.ToolPackingPrevention (open/close "
+       "monitors that slow drawers before their stops and report straining; slam and cabinet-moved "
+       "watchdog)",
        "fix = prev.fixture('toolbox', 0.3); multiply every drawer pull/push action by fix.scale()",
        _PLACE.format(obj="<tool>")),
     _p("egg_carton", 0.3, 0.5, 0.2,  # G1 hand: N·m, rated 1.4
+       "prefer robobench.suites.packing.prevention.egg_carton.EggCartonPrevention (minimal "
+       "adaptive grip under a crush cap, release only low over a free pocket, lid check, drop and "
+       "slip watchdog)",
        "grip eggs with 0.3 N·m; boost only to 0.5", _PLACE.format(obj="egg_0"),
        "close the lid with prev.fixture('carton', 1.0).scale() on the push"),
     _p("clear_organic_objects", 0.4, 0.8, 0.3,
+       "prefer robobench.suites.packing.prevention.clear_organic_objects.ClearOrganicPrevention "
+       "(set-down test before release, slow placement over the bin, drop/throw watchdog)",
        _PLACE.format(obj="<produce>") + " — into the bin, never thrown"),
     # Puzzle / liquid
     _p("coffee", 15.0, 25.0, 0.25,
+       "prefer robobench.suites.puzzle.prevention.coffee.CoffeePrevention (brew-setup check + staff "
+       "sign-off before START; watchdog for unverified brews, the robot in the stream, the cup "
+       "pulled mid-brew and a tipped full cup)",
        "ok, info = prev.aligned('cup', spout_xy_z, pos_tol=0.01); "
        "prev.verify_then_approve('brew_setup_verified', ok, info) before pressing start",
        _PLACE.format(obj="cup")),
     _p("spatula", 25.0, 40.0, 0.5,
+       "prefer robobench.suites.puzzle.prevention.spatula.SpatulaPrevention (flip-load grip, "
+       "secure test before flipping, slow near surfaces, unsecured-flip and strike watchdog)",
        _FIRM.format(obj="spatula"), "approach the plate with a PlacementGuard to avoid striking it"),
     _p("syringe", 15.0, 25.0, 0.15,
+       "prefer robobench.suites.puzzle.prevention.syringe.SyringePrevention (aim check, a 1 s "
+       "steady wait, staff sign-off per tube, dispense only where verified; watchdog for "
+       "unverified dispensing, spraying at the robot and spills)",
        "aim = prev.aim('syringe', local_axis=nozzle_axis); dispense only if aim.safe_to_dispense()",
        "after aiming, wait for prev.verify_then_approve('aim_verified', aim.safe_to_dispense())"),
     _p("push_shapes", None, None, 0.3,
+       "prefer robobench.suites.puzzle.prevention.push_shapes.PushShapesPrevention (position and "
+       "yaw check before the final push, PushMonitor that stops on misaligned / jammed, slow near "
+       "seated blocks, knocked-neighbour / wrong-recess / lifted watchdog)",
        "check prev.aligned(block, pad_xyz, target_axis=...) before the final push; correct, don't force"),
-    _p("classify_objects", 0.5, 0.8, 0.3, _PLACE.format(obj="<block>")),
+    _p("classify_objects", 0.5, 0.8, 0.3,
+       "prefer robobench.suites.puzzle.prevention.classify_objects.ClassifyPrevention (right-zone "
+       "check, release only resting at table height, slow placement, drop / wrong-zone watchdog)",
+       _PLACE.format(obj="<block>")),
     _p("stack_blocks", 0.5, 0.8, 0.2,
+       "prefer robobench.suites.puzzle.prevention.stack_blocks.StackPrevention (squarely-on-top check, slow placement, tower-fell / drop watchdog)",
        "ok, info = prev.aligned(block, top_of_tower_xyz, pos_tol=0.005) before lowering",
        _PLACE.format(obj="<block>")),
     # Deformable
-    _p("tshirt", 30.0, 40.0, 0.5, "pinch with a capped grip; move slowly so the cloth is not torn"),
+    _p("tshirt", 30.0, 40.0, 0.5,
+       "prefer robobench.suites.deformable.prevention.tshirt.TshirtPrevention (stretch limit, release only over the table, off-table / floor watchdog)", "pinch with a capped grip; move slowly so the cloth is not torn"),
     _p("latte", 15.0, 25.0, 0.15,
+       "prefer robobench.suites.deformable.prevention.latte.LattePrevention (sense + confirm the mug, pour only with the lip over it, milk-on-robot watchdog)",
        "pour = prev.pour('pitcher', 'coffee_cup', spout_offset=...); tilt only while pour.safe_to_pour()",
        "prev.verify_then_approve('cup_located', pour.safe_to_pour()) before the first tilt"),
-    _p("dumpling", 30.0, 40.0, 0.3, _FIRM.format(obj="pin")),
+    _p("dumpling", 30.0, 40.0, 0.3,
+       "prefer robobench.suites.deformable.prevention.dumpling.DumplingPrevention (edge margin, no punch-through, dough-off-board / pin-dropped watchdog)", _FIRM.format(obj="pin")),
     _p("knot", 10.0, 15.0, 0.2,
+       "prefer robobench.suites.deformable.prevention.shoe_knot.KnotPrevention (release check on every opening, freeze + staff clear when fingers are caught)",
        "chk = prev.finger_release(); chk.start() when opening; if not chk.fingers_free(): stop and "
        "request_approval(env, 'fingers_free_verified')"),
     # Cutting
     _p("slice", 40.0, 60.0, 0.15,
+       "prefer robobench.suites.cutting.prevention.slice.SlicePrevention (cut-load grip, secure test before cutting, slow near the board, drop / slip watchdog)",
        _FIRM.format(obj="knife"),
        "knife = prev.knife('knife', board_top_z, food=None); cut only while knife.safe_to_cut()"),
     _p("dice", 40.0, 60.0, 0.15,
+       "prefer robobench.suites.cutting.prevention.dice.DicePrevention (sense the cut plane, blade on it over the food, board / counter cut watchdog)",
        _FIRM.format(obj="knife"),
        "knife = prev.knife('knife', board_top_z, food); "
        "prev.verify_then_approve('cut_position_verified', knife.over_food()) before each cut"),
     # Loco-manipulation (G1 hand: N·m)
     _p("fruit_delivery", 0.4, 0.8, 0.5,
+       "prefer robobench.suites.locomanip.prevention.fruit_delivery.FruitDeliveryPrevention (set-down test on the plate, drop watchdog)",
        _FIRM.format(obj="<fruit>"), _PLACE.format(obj="<fruit>") + " — onto the plate"),
     _p("box_to_bin", 1.0, 1.4, 0.5,
+       "prefer robobench.suites.locomanip.prevention.box_to_bin.BoxToBinPrevention (grip sized for the walk, release only in the bin, drop / slip watchdog)",
        _FIRM.format(obj="box"), _PLACE.format(obj="box")),
     _p("wheel_carry", 1.0, 1.4, 0.5,
+       "prefer robobench.suites.locomanip.prevention.wheel_carry.WheelCarryPrevention (firm grip, steady hold + staff grasp check before walking)",
        _FIRM.format(obj="wheel"),
        "after the grasp: prev.verify_then_approve('grasp_verified', ~hold.slipping) and wait for staff",
        _PLACE.format(obj="wheel")),
@@ -928,6 +1084,13 @@ def setup_prevention(env: BaseEnv, scene: str) -> Prevention:
 
 
 # ----- carrying a part: shared by task preventions ------------------------------------------------
+def parallel_grippers(env: BaseEnv) -> bool:
+    """True when every gripper has at most two finger joints (a parallel jaw) — the shared release
+    gate's single closing direction is only meaningful there, not on multi-finger hands."""
+    gs = [g for g in _guards(env) if bool(g.grip.any())]
+    return bool(gs) and all(int(g.grip.sum()) <= 2 for g in gs)
+
+
 G = 9.81
 
 
@@ -958,10 +1121,15 @@ class CarryPrevention:
 
     def __init__(self, env: BaseEnv, grip_force: float, grip_force_max: float,
                  carry_speed: float = 0.3, carry_height: float = 0.10, close_sign: float = -1.0,
-                 open_margin: float = 0.003, grip_arms: Sequence[str] | None = None) -> None:
+                 open_margin: float = 0.003, grip_arms: Sequence[str] | None = None,
+                 gate_fingers: bool = True) -> None:
         import torch
 
         self.env, self.scene = env, env.scene
+        #: False: never hold fingers closed (hands whose joints close in different directions,
+        #: e.g. a three-finger hand, where one `close_sign` cannot tell opening from closing).
+        #: The task must then end carries itself (`released`) and check releases another way.
+        self.gate_fingers = gate_fingers
         self.carry_height, self.close_sign, self.open_margin = carry_height, close_sign, open_margin
         self.grip = GripGovernor(env, min(grip_force, grip_force_max), grip_force_max, arms=grip_arms)
         self.speed = SpeedGovernor(env)
@@ -1069,6 +1237,8 @@ class CarryPrevention:
         supported part) the part counts as put down. Only the holding hand is gated and watched."""
         import torch
 
+        if not self.gate_fingers:
+            return
         blocked = ~self.release_allowed()
         newly = blocked & ~self.gate_closed
         opened = torch.zeros_like(blocked)

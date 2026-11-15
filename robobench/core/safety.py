@@ -490,6 +490,17 @@ class SafetyShield:
                     g.latch(new)
             self.tripped |= new
 
+    def flag(self, kind: str, mask, detail: dict | None = None) -> None:
+        """Record a hazard a prevention helper detected, for the envs in `mask` (n,) bool: it counts
+        as a violation of `kind` (the trajectory is reported unsafe) and, in enforce mode, latches
+        the software e-stop like any other violation."""
+        import torch
+
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=self.tripped.device)
+        if bool(mask.any()):
+            info = dict(detail or {})
+            self._record({kind: mask}, {kind: [(mask, lambda e: info)]})
+
     # -- approvals ------------------------------------------------------------------------------
     def approve(self, name: str, info: dict | None = None) -> bool:
         """Ask the operator to sign off a risky step. A denial in enforce mode trips every env."""

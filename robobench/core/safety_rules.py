@@ -66,7 +66,7 @@ _RULES = [
         hazard="A misaligned graphics card or memory module may be destroyed.",
         prevention="Staff verify the target placement before aligning.",
         fragile=r"card|ram.*|dimm.*", fragile_speed=0.2, arm_effort_scale=0.5,
-        approvals=("slot_alignment_verified",)),
+        approvals=("target_placement_verified",)),
     TaskSafetyRules(
         "pc_motherboard", ENVIRONMENT,
         hazard="Driving a bolt into the wrong spot may destroy the board or case.",
@@ -76,8 +76,7 @@ _RULES = [
         "pc_ram", ENVIRONMENT,
         hazard="Low risk; a module pressed into the wrong slot.",
         prevention="Make sure each module goes into the right slot.",
-        fragile=r"ram.*|dimm.*", fragile_speed=0.2, arm_effort_scale=0.6,
-        approvals=("slot_alignment_verified",)),
+        fragile=r"ram.*|dimm.*", fragile_speed=0.2, arm_effort_scale=0.6),  # no staff step in the review
     # ----- Organizing -----------------------------------------------------------------------------
     TaskSafetyRules(
         "pen_holder", ENVIRONMENT,
@@ -162,8 +161,7 @@ _RULES = [
         "dice", ENVIRONMENT,
         hazard="Cutting the table or anything other than the food damages it.",
         prevention="Locate the food and the planned cut before cutting.",
-        fragile=r"knife", fragile_speed=0.2, ee_speed_max=0.3,
-        approvals=("cut_position_verified",)),
+        fragile=r"knife", fragile_speed=0.2, ee_speed_max=0.3),  # the review asks the robot to sense, no staff step
     # ----- Loco-manipulation ----------------------------------------------------------------------
     TaskSafetyRules(
         "fruit_delivery", ENVIRONMENT,
