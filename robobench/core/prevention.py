@@ -14,6 +14,7 @@ solution AVOID it in the first place. Two kinds of tools:
                       "verify before forcing": pose check, then operator sign-off
     InsertionMonitor  pressing in (GPU, RAM, bolts, threads): reports "stalled" instead of shoving
     HoldMonitor       a held object slipping in the hand (knife, box, wheel) — boosts the grip
+    TurnMonitor       a part turned by hand spinning in the fingers (nut, bulb) — boosts the grip
     FixtureGuard      drawers and lids: a 0..1 scale to slow the pull before it slams
     PourGuard         pour only with the receiving cup under the spout (latte, coffee)
     AimGuard          dispense only when the nozzle does not point at the robot (syringe)
@@ -74,6 +75,14 @@ def add_post_step(env: BaseEnv, fn: Callable[[], None]) -> None:
     _hook(env, fn, "post_hooks", "post_step", "_prevention_post")
 
 
+def remove_post_step(env: BaseEnv, fn: Callable[[], None]) -> None:
+    """Stop running a function added with `add_post_step` (no-op if it is not registered)."""
+    shield = getattr(env, "safety", None)
+    chain = shield.post_hooks if shield is not None else env.robot.__dict__.get("_prevention_post", [])
+    if fn in chain:
+        chain.remove(fn)
+
+
 def _hook(env, fn, shield_list: str, method: str, chain_attr: str, run_before: bool = False) -> None:
     shield = getattr(env, "safety", None)
     if shield is not None:
@@ -131,10 +140,15 @@ def _guards(env: BaseEnv) -> list[_ArmGuard]:
 
 
 def _obj(env: BaseEnv, key: str):
+    """A scene part by name: a rigid object, or an articulation (its root link stands in for the
+    part — e.g. a multi-link sub-assembly carried as one piece)."""
     objs = getattr(env.iscene, "rigid_objects", {}) or {}
-    if key not in objs:
-        raise KeyError(f"no rigid object '{key}'. Known: {sorted(objs)}")
-    return objs[key]
+    if key in objs:
+        return objs[key]
+    arts = getattr(env.iscene, "articulations", {}) or {}
+    if key in arts:
+        return arts[key]
+    raise KeyError(f"no rigid object or articulation '{key}'. Known: {sorted(objs) + sorted(arts)}")
 
 
 def _vec(env: BaseEnv, v, n: int | None = None):
@@ -159,6 +173,22 @@ def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return quat_rotate(q * q.new_tensor((1.0, -1.0, -1.0, -1.0)), v)
 
 
+def _quat_conj(q: torch.Tensor) -> torch.Tensor:
+    return q * q.new_tensor((1.0, -1.0, -1.0, -1.0))
+
+
+def _quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of (n, 4) wxyz quaternions."""
+    import torch
+
+    aw, ax, ay, az = a.unbind(-1)
+    bw, bx, by, bz = b.unbind(-1)
+    return torch.stack((aw * bw - ax * bx - ay * by - az * bz,
+                        aw * bx + ax * bw + ay * bz - az * by,
+                        aw * by - ax * bz + ay * bw + az * bx,
+                        aw * bz + ax * by - ay * bx + az * bw), dim=-1)
+
+
 INF = float("inf")
 
 
@@ -170,10 +200,14 @@ class GripGovernor:
     in its units (N for parallel-jaw fingers, N·m for the G1 hand joints, rated 1.4).
 
     "Minimal pressure" tasks set a low `force`; "firm" tasks a higher one, and `boost()` (called by
-    a HoldMonitor when the object slips) raises it step by step up to `force_max`."""
+    a HoldMonitor when the object slips) raises it step by step up to `force_max`.
+
+    `arms`: on a multi-arm robot, the arms whose grippers this governs, by name fragment (e.g.
+    ("right",) matches "right/franka"). Default: every gripper. Use it when only one hand handles
+    the part this force is meant for, and the other hand needs its own grip (holding a table)."""
 
     def __init__(self, env: BaseEnv, force: float, force_max: float | None = None,
-                 default_stiffness: float = 2000.0) -> None:
+                 default_stiffness: float = 2000.0, arms: Sequence[str] | None = None) -> None:
         import torch
 
         self.force, self.force_max = force, max(force, force_max or force)
@@ -181,12 +215,15 @@ class GripGovernor:
         for g in _guards(env):
             if not bool(g.grip.any()):
                 continue
+            if arms is not None and not any(a in g.name for a in arms):
+                continue
             k = getattr(g.art.data, "joint_stiffness", None)
             k = k[0].clone() if k is not None else torch.full_like(g.rated_vel, default_stiffness)
             k = torch.where(k > 0, k, torch.full_like(k, default_stiffness))
             self._arms.append((g.art, g.grip, k, _RawCommand(), _RawCommand()))
         if not self._arms:
-            raise ValueError("no gripper joints found on this robot")
+            raise ValueError("no gripper joints found on this robot"
+                             + (f" matching arms={tuple(arms)}" if arms is not None else ""))
         add_command_filter(env, self._filter, before=self._snapshot)
 
     def _snapshot(self) -> None:
@@ -401,17 +438,31 @@ class InsertionMonitor:
         self.stalled.zero_()
         self._window.clear()
 
+    def close(self) -> None:
+        """Stop watching (unhooks the per-substep update). Monitors are otherwise kept alive by the
+        hook for the rest of the episode, so close ones you are done with."""
+        remove_post_step(self.env, self._update)
+
 
 class HoldMonitor:
     """Watches a held object for slip: after `lock()` (right after the grasp) it records the
     object's offset from the nearest hand; drifting more than `slip_tol` means it is sliding out.
-    With a `grip` governor it tightens the grip automatically on slip ("hold firmly")."""
+    With `slip_deg`, it also records the object's orientation relative to the hand: turning more
+    than `slip_deg` in the fingers (a long part pivoting about the grasp) is slip too.
+    With a `grip` governor it tightens the grip automatically on slip ("hold firmly").
+
+    For a multi-link part (an articulation), the link nearest the hand at `lock()` is the one
+    watched — the link actually in the fingers — so the part's own joints flexing elsewhere is
+    not mistaken for slip."""
 
     def __init__(self, env: BaseEnv, obj: str, slip_tol: float = 0.01,
-                 grip: GripGovernor | None = None) -> None:
+                 grip: GripGovernor | None = None, slip_deg: float | None = None) -> None:
         import torch
 
         self.env, self.obj, self.slip_tol, self.grip = env, _obj(env, obj), slip_tol, grip
+        self.slip_deg = slip_deg
+        self._rel_q = None
+        self._link = None  # (n,) watched link per env, for multi-link parts
         self._hands = [(g.art, g.ee_idx) for g in _guards(env) if g.ee_idx is not None]
         if not self._hands:
             raise ValueError("no end-effector body found to measure the hold against")
@@ -425,30 +476,127 @@ class HoldMonitor:
         art, idx = hand
         return art.data.body_pos_w[:, idx]
 
+    def _hand_quat(self, hand):
+        art, idx = hand
+        q = getattr(art.data, "body_quat_w", None)
+        return None if q is None else q[:, idx]
+
+    def part_pos(self) -> torch.Tensor:
+        """(n, 3) position of the watched part (its grasped link, or its root)."""
+        import torch
+
+        d = self.obj.data
+        if self._link is None:
+            return d.root_pos_w
+        return d.body_pos_w[torch.arange(self._link.shape[0], device=self._link.device), self._link]
+
+    def part_quat(self) -> torch.Tensor:
+        import torch
+
+        d = self.obj.data
+        if self._link is None:
+            return d.root_quat_w
+        return d.body_quat_w[torch.arange(self._link.shape[0], device=self._link.device), self._link]
+
     def lock(self) -> None:
         p = self.obj.data.root_pos_w
         self._hand = min(self._hands, key=lambda h: float((self._hand_pos(h)[0] - p[0]).norm()))
-        self._rel = p - self._hand_pos(self._hand)
+        bodies = getattr(self.obj.data, "body_pos_w", None)
+        self._link = None
+        if bodies is not None and bodies.shape[1] > 1:  # multi-link: watch the link in the fingers
+            self._link = (bodies - self._hand_pos(self._hand)[:, None]).norm(dim=-1).argmin(dim=1)
+        self._rel = self.part_pos() - self._hand_pos(self._hand)
+        hq = self._hand_quat(self._hand)
+        self._rel_q = None if hq is None else _quat_mul(_quat_conj(hq), self.part_quat())
         self.slipping.zero_()
 
     def release(self) -> None:
-        self._hand = self._rel = None
+        self._hand = self._rel = self._rel_q = self._link = None
+
+    def turn_deg(self) -> torch.Tensor:
+        """(n,) how far the object has turned in the hand since `lock()` (deg; 0 if not locked or
+        the hand's orientation is unknown)."""
+        import torch
+
+        if self._hand is None or self._rel_q is None:
+            return torch.zeros_like(self.slipping, dtype=torch.float32)
+        rel = _quat_mul(_quat_conj(self._hand_quat(self._hand)), self.part_quat())
+        dot = (rel * self._rel_q).sum(-1).abs().clamp(max=1.0)
+        return torch.rad2deg(2.0 * torch.arccos(dot))
 
     def drift(self) -> torch.Tensor:
         import torch
 
         if self._hand is None:
             return torch.zeros_like(self.slipping, dtype=torch.float32)
-        rel = self.obj.data.root_pos_w - self._hand_pos(self._hand)
+        rel = self.part_pos() - self._hand_pos(self._hand)
         return (rel - self._rel).norm(dim=-1)
 
     def _update(self) -> None:
         if self._hand is None:
             return
-        new = (self.drift() > self.slip_tol) & ~self.slipping
+        slip = self.drift() > self.slip_tol
+        if self.slip_deg is not None:
+            slip |= self.turn_deg() > self.slip_deg
+        new = slip & ~self.slipping
         if bool(new.any()) and self.grip is not None:
             self.grip.boost()
         self.slipping |= new
+
+
+class TurnMonitor:
+    """Turning a part by hand (a nut, a bulb, a leg): the torque reaches it only through pad
+    friction, so if the hand turns and the part does not, it is spinning in the fingers. Each
+    `slip_time` of that raises `grip` one `boost` step, up to its cap; past the cap `slipping_at_cap`
+    is set (stop: squeezing harder is not allowed). Rates are about `axis_fn()` -> (n, 3), measured
+    against the hand nearest the part when the monitor starts. Only active where `active_fn()` is
+    True (e.g. while driving, not once seated). `close()` when done."""
+
+    def __init__(self, env: BaseEnv, obj: str, axis_fn: Callable[[], Any], grip: GripGovernor,
+                 active_fn: Callable[[], Any] | None = None, min_rate: float = 0.2,
+                 slip_ratio: float = 0.5, slip_time: float = 0.05, boost: float = 1.25) -> None:
+        import torch
+
+        self.env, self.obj, self.axis_fn, self.grip, self.active_fn = env, _obj(env, obj), axis_fn, grip, active_fn
+        self.min_rate, self.slip_ratio, self.boost = min_rate, slip_ratio, boost
+        self._hands = [g for g in _guards(env) if g.ee_idx is not None]
+        if not self._hands:
+            raise ValueError("no end-effector body found to measure the turn against")
+        p = self.obj.data.root_pos_w
+        d = torch.stack([(g.art.data.body_pos_w[:, g.ee_idx] - p).norm(dim=-1) for g in self._hands], 1)
+        self._hand = d.argmin(dim=1)
+        self._need = max(1, round(slip_time / env.dt))
+        self._count = torch.zeros(env.num_envs, dtype=torch.long, device=p.device)
+        self.slipping_at_cap = torch.zeros(env.num_envs, dtype=torch.bool, device=p.device)
+        add_post_step(env, self._update)
+
+    def rates(self):
+        """(hand, part) angular speeds about the axis (rad/s), each (n,)."""
+        import torch
+
+        axis = self.axis_fn()
+        w = torch.stack([g.art.data.body_ang_vel_w[:, g.ee_idx] for g in self._hands], 1)
+        rows = torch.arange(w.shape[0], device=w.device)
+        return (w[rows, self._hand.to(w.device)] * axis).sum(-1), (self.obj.data.root_ang_vel_w * axis).sum(-1)
+
+    def _update(self) -> None:
+        import torch
+
+        w_hand, w_part = self.rates()
+        slip = (w_hand.abs() > self.min_rate) & (w_part.abs() < self.slip_ratio * w_hand.abs())
+        if self.active_fn is not None:
+            slip &= torch.as_tensor(self.active_fn(), dtype=torch.bool, device=slip.device)
+        self._count = torch.where(slip, self._count + 1, torch.zeros_like(self._count))
+        due = self._count >= self._need
+        if bool(due.any()):
+            if self.grip.force < self.grip.force_max - 1e-9:
+                self.grip.boost(self.boost)
+            else:
+                self.slipping_at_cap |= due
+            self._count = torch.where(due, torch.zeros_like(self._count), self._count)
+
+    def close(self) -> None:
+        remove_post_step(self.env, self._update)
 
 
 class FixtureGuard:
@@ -619,7 +767,7 @@ def _p(scene, grip=None, grip_max=None, ee_speed=None, *steps):
 
 PREVENTION: dict[str, TaskPrevention] = {p.scene: p for p in [
     # Assembly (Franka / xArm7 / Gen3: grip in N)
-    # allen_bolt and bulb have dedicated modules; prefer them over these generic plans.
+    # allen_bolt, bulb, ikea_table, so101 and nut_thread have dedicated modules; prefer them over these generic plans.
     _p("allen_bolt", 30.0, 60.0, 0.5,
        "prefer robobench.suites.assembly.prevention.allen_bolt.AllenBoltPrevention (grip from the "
        "parts' physics, lift test, release gate, key-in-socket and drive checks)",
@@ -632,12 +780,21 @@ PREVENTION: dict[str, TaskPrevention] = {p.scene: p for p in [
        "ins = prev.insertion('bulb_0', axis=(0, 0, -1), seat_depth); screw while ins.status() is 'moving'; "
        "on 'stalled' unscrew, re-align, ins.reset()"),
     _p("ikea_table", 40.0, 60.0, 0.3,
+       "prefer robobench.suites.assembly.prevention.ikea_table.IkeaTablePrevention (free-stud and "
+       "pose check, operator sign-off per leg, LegDrive that stops on unverified / off_target / "
+       "table_moving / stalled)",
        "for each leg: ok, info = prev.aligned(leg, stud_xyz, target_axis=(0, 0, -1)); "
        "prev.verify_then_approve('leg_positions_verified', ok, info) before threading",
        "thread with prev.insertion(leg, axis, seat_depth); back off on 'stalled'"),
     _p("so101", 25.0, 40.0, 0.3,
+       "prefer robobench.suites.assembly.prevention.so101.SO101Prevention (grip from each part's "
+       "weight incl. what is attached to it, slip and pivot detection, lift test, no release "
+       "until the part rests on the bench or is seated)",
        _FIRM.format(obj="<part>"), _PLACE.format(obj="<part>")),
     _p("nut_thread", 20.0, 30.0, 0.3,
+       "prefer robobench.suites.assembly.prevention.nut_thread.NutThreadPrevention (check the nut "
+       "on the bolt before turning, NutDrive that stops on unchecked / off_axis / wrong_direction / "
+       "cross_threaded / slipping_at_cap / seated, no release until threaded or on the table)",
        "ok, info = prev.aligned('nut_0', bolt_tip_xyz, target_axis=(0, 0, 1)); verify before turning",
        "ins = prev.insertion('nut_0', axis=(0, 0, -1), seat_depth); unwind on 'stalled'"),
     _p("pc_gpu", 15.0, 25.0, 0.2,
@@ -793,16 +950,20 @@ class CarryPrevention:
       - a release gate: the fingers may not OPEN while a held part is unsupported
       - carry speed: the arm is slowed to `carry_speed` while something is held
       - the carry ends by itself once the fingers open on a supported part
+
+    Multi-arm robots: the gate and the "fingers opened" test apply only to the hand holding the
+    part (the gripper nearest it when it is marked held), so the other hand stays free. `grip_arms`
+    limits which hands the GripGovernor shapes (see `GripGovernor`; default: all).
     """
 
     def __init__(self, env: BaseEnv, grip_force: float, grip_force_max: float,
                  carry_speed: float = 0.3, carry_height: float = 0.10, close_sign: float = -1.0,
-                 open_margin: float = 0.003) -> None:
+                 open_margin: float = 0.003, grip_arms: Sequence[str] | None = None) -> None:
         import torch
 
         self.env, self.scene = env, env.scene
         self.carry_height, self.close_sign, self.open_margin = carry_height, close_sign, open_margin
-        self.grip = GripGovernor(env, min(grip_force, grip_force_max), grip_force_max)
+        self.grip = GripGovernor(env, min(grip_force, grip_force_max), grip_force_max, arms=grip_arms)
         self.speed = SpeedGovernor(env)
         self.speed.add_limit(self._carry_limit(carry_speed))
         self._holds: dict[str, HoldMonitor] = {}
@@ -812,7 +973,23 @@ class CarryPrevention:
         self._gate_q = [g.art.data.joint_pos.clone() for g in self._grip_guards]
         self._q_grasp = [g.art.data.joint_pos.clone() for g in self._grip_guards]
         self.gate_closed = torch.zeros(env.num_envs, dtype=torch.bool, device=dev)
+        #: per env: index into the grippers of the hand holding the part (-1 = all hands)
+        self._held_arm = torch.full((env.num_envs,), -1, dtype=torch.long, device=dev)
         add_command_filter(env, self._release_gate)
+
+    def _nearest_gripper(self, obj: str) -> torch.Tensor:
+        """(n,) index of the gripper whose hand is nearest `obj` (-1 when no hand body is known or
+        there is only one gripper, which means: gate every gripper, as for a single arm)."""
+        import torch
+
+        n = self.env.num_envs
+        dev = self._held_arm.device
+        if len(self._grip_guards) < 2 or any(g.ee_idx is None for g in self._grip_guards):
+            return torch.full((n,), -1, dtype=torch.long, device=dev)
+        p = _obj(self.env, obj).data.root_pos_w.to(dev)
+        d = torch.stack([(g.art.data.body_pos_w[:, g.ee_idx].to(dev) - p).norm(dim=-1)
+                         for g in self._grip_guards], dim=1)  # (n, G)
+        return d.argmin(dim=1)
 
     # -- subclass hooks -------------------------------------------------------------------------
     def supported(self, obj: str) -> torch.Tensor:
@@ -824,10 +1001,14 @@ class CarryPrevention:
         return None
 
     # -- grip -----------------------------------------------------------------------------------
+    #: rotational slip tolerance for `hold()` monitors (deg); None = position slip only
+    hold_slip_deg: float | None = None
+
     def hold(self, obj: str, slip_tol: float = 0.005) -> HoldMonitor:
         """A slip monitor on `obj` that tightens the grip on slip."""
         if obj not in self._holds:
-            self._holds[obj] = HoldMonitor(self.env, obj, slip_tol=slip_tol, grip=self.grip)
+            self._holds[obj] = HoldMonitor(self.env, obj, slip_tol=slip_tol, grip=self.grip,
+                                           slip_deg=self.hold_slip_deg)
         return self._holds[obj]
 
     def lift_test(self, obj: str, step_fn: Callable[[], None], steps: int = 20,
@@ -837,10 +1018,10 @@ class CarryPrevention:
         only if every env passed — anything else: put it down and re-grasp, do not carry."""
         mon = self.hold(obj)
         mon.lock()
-        z0 = _obj(self.env, obj).data.root_pos_w[:, 2].clone()
+        z0 = mon.part_pos()[:, 2].clone()  # the grasped link: a multi-link part may flex elsewhere
         for _ in range(steps):
             step_fn()
-        ok = ((_obj(self.env, obj).data.root_pos_w[:, 2] - z0) >= min_rise) & ~mon.slipping
+        ok = ((mon.part_pos()[:, 2] - z0) >= min_rise) & ~mon.slipping
         extra = self._lift_ok(obj)
         if extra is not None:
             ok &= extra.to(ok.device)
@@ -856,6 +1037,7 @@ class CarryPrevention:
         self.hold(obj).lock()
         for e in range(self.env.num_envs):
             self._held_obj[e] = obj
+        self._held_arm = self._nearest_gripper(obj)
         for g, q in zip(self._grip_guards, self._q_grasp):
             q.copy_(g.art.data.joint_pos)  # the closure on the part: "opened" is measured from here
 
@@ -884,20 +1066,21 @@ class CarryPrevention:
         """Fingers may close any time but may not OPEN while a held part is unsupported: an opening
         command is replaced by the closure the fingers had when the gate engaged. Once the fingers
         do open (more than `open_margin` past the grasp closure, which the gate only allows on a
-        supported part) the part counts as put down."""
+        supported part) the part counts as put down. Only the holding hand is gated and watched."""
         import torch
 
         blocked = ~self.release_allowed()
         newly = blocked & ~self.gate_closed
         opened = torch.zeros_like(blocked)
-        for g, q_gate, q_grasp in zip(self._grip_guards, self._gate_q, self._q_grasp):
+        for k, (g, q_gate, q_grasp) in enumerate(zip(self._grip_guards, self._gate_q, self._q_grasp)):
             d = g.art.data
+            holder = (self._held_arm == k) | (self._held_arm < 0)  # (n,) this hand holds the part
             q_gate[newly] = d.joint_pos[newly]
             opening = (d.joint_pos_target - q_gate) * self.close_sign < 0  # target on the open side
-            hold = blocked[:, None] & g.grip & opening
+            hold = (blocked & holder)[:, None] & g.grip & opening
             d.joint_pos_target.copy_(torch.where(hold, q_gate, d.joint_pos_target))
             wide = (d.joint_pos - q_grasp) * self.close_sign < -self.open_margin
-            opened |= (wide & g.grip).any(dim=1)
+            opened |= (wide & g.grip).any(dim=1) & holder
         self.gate_closed = blocked
         held = torch.tensor([o is not None for o in self._held_obj], device=blocked.device)
         done = held & ~blocked & opened

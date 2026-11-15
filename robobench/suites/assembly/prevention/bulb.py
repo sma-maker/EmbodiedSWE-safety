@@ -45,18 +45,24 @@ Usage in a solution:
         screw = prev.screw(0)
         while not screw.should_stop()[0]:
             env.step(turn_and_press_action)              # grip rises only if the bulb slips
+            ...                                          # wrist out of travel: open (allowed once
+            prev.mark_held("bulb_0")                     # threaded), rotate back, close, mark_held
         if screw.status()[0] != "seated":
             ...                                          # "binding" / "slipping_at_cap": back off
-        # to re-grip on a threaded bulb mid-screw: open (allowed — it is threaded), rotate back,
-        # close, then prev.mark_held("bulb_0")
+
+Re-gripping is normal: from first thread contact (32 mm) to seated (27 mm) is ~1.4 turns of an E27
+thread (~3.6 mm per turn), more than a wrist turns. While the fingers are open the slip check is
+off (the wrist turning back is not slip), and the grip the bulb needed is kept for the re-grip.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from robobench.core.prevention import (CarryPrevention, InsertionMonitor, add_post_step, quat_rotate,
-                                       quat_rotate_inverse, required_grip_force, _guards, _obj)
+import math
+
+from robobench.core.prevention import (CarryPrevention, InsertionMonitor, TurnMonitor, quat_rotate,
+                                       quat_rotate_inverse, required_grip_force, _obj)
 
 if TYPE_CHECKING:
     import torch
@@ -117,9 +123,15 @@ class BulbPrevention(CarryPrevention):
         self.grip.force = self.hold_force
 
     def released(self, obj: str, envs=None) -> None:
+        """Back to the minimal grip once nothing is held — unless the bulb was let go part-way
+        into the thread (a re-grip): then the grip it needed to turn is kept for the next close."""
         super().released(obj, envs)
-        if not bool(self.carrying().any()):
-            self.relax_grip()  # each new grasp starts minimal again
+        if bool(self.carrying().any()):
+            return
+        i = int(obj.split("_")[1])
+        mid_screw = self.threaded(i) & ~self.seated(i)
+        if not bool(mid_screw.any()):
+            self.relax_grip()  # put down or seated: the next grasp starts minimal again
 
     # -- socket geometry ------------------------------------------------------------------------
     def _sockets(self) -> list:
@@ -206,18 +218,27 @@ class BulbPrevention(CarryPrevention):
 
     # -- 4. screw without over-tightening -------------------------------------------------------
     def screw(self, i: int = 0, **kw) -> ScrewMonitor:
-        """Start a `ScrewMonitor` on bulb `i` (call once the bulb sits aligned on the socket)."""
-        return ScrewMonitor(self, i, **kw)
+        """Start a `ScrewMonitor` on bulb `i` (call once the bulb sits aligned on the socket).
+        Closes the previous one, so an old monitor never keeps raising the grip on the glass."""
+        old = getattr(self, "_screw", None)
+        if old is not None:
+            old.close()
+        self._screw = ScrewMonitor(self, i, **kw)
+        return self._screw
 
     # -- 5. never let go in the air -------------------------------------------------------------
-    def supported(self, obj: str, still: float = 0.02) -> torch.Tensor:
-        """(n,) bool: the bulb is lying on the table, or threaded into a socket — and not moving."""
+    def supported(self, obj: str, still: float = 0.02, lying_deg: float = 60.0) -> torch.Tensor:
+        """(n,) bool: the bulb is LYING on the table (axis at least `lying_deg` off vertical), or
+        threaded into a socket — and not moving. A bulb standing on its cap is not supported: it is
+        top-heavy, and let go it tips over onto its glass."""
         i = int(obj.split("_")[1])
         d = _obj(self.env, obj).data
         slow = d.root_lin_vel_w.norm(dim=-1) < still
+        axis = quat_rotate(d.root_quat_w, d.root_quat_w.new_tensor((0.0, 0.0, 1.0)).expand(d.root_pos_w.shape[0], 3))
+        flat = axis[:, 2].abs() <= math.cos(math.radians(lying_deg))
         # lying, the bulb's origin settles ~5 mm up (it is dropped from bulb_init_z at reset)
-        lying = d.root_pos_w[:, 2] - self._surface_z() < self.scene.cfg.bulb_init_z + 0.006
-        return (lying | self.threaded(i).to(lying.device)) & slow
+        low = d.root_pos_w[:, 2] - self._surface_z() < self.scene.cfg.bulb_init_z + 0.006
+        return ((low & flat) | self.threaded(i).to(low.device)) & slow
 
 
 class ScrewMonitor:
@@ -230,55 +251,36 @@ class ScrewMonitor:
                          squeezing harder is exactly what must not happen
       "turning"          keep going
 
-    Rotational slip below the cap raises the grip one `boost` step at a time — that is the "minimal
-    pressure" part: force grows only when the bulb proves it needs it."""
+    Rotational slip raises the grip one `boost` step at a time — the "minimal pressure" part: force
+    grows only when the bulb proves it needs it. Slip is judged only while the fingers hold the bulb
+    and it is "turning": not while re-gripping (open fingers turning back), and not after a stop.
+    `close()` when done (`prev.screw()` closes the previous monitor itself)."""
 
     def __init__(self, prev: BulbPrevention, i: int = 0, min_rate: float = 0.2,
                  slip_ratio: float = 0.5, slip_time: float = 0.05, boost: float = 1.25,
                  bind_effort_ratio: float = 0.5, bind_window_s: float = 0.5,
                  bind_min_progress: float = 0.0002) -> None:
-        import torch
-
         self.prev, self.i, self.env = prev, i, prev.env
-        self.min_rate, self.slip_ratio, self.boost = min_rate, slip_ratio, boost
-        self._slip_steps = max(1, round(slip_time / self.env.dt))
-        hands = [g for g in _guards(self.env) if g.ee_idx is not None]
-        if not hands:
-            raise ValueError("no end-effector body found to measure the turn against")
-        self._hand = hands[0]
         _, up = prev._nearest(i)
         remaining = (prev.height(i) - prev.scene.cfg.seat_z).clamp_min(0.0)
         self.bind = InsertionMonitor(self.env, f"bulb_{i}", axis=-up, seat_depth=remaining,
                                      effort_ratio=bind_effort_ratio, window_s=bind_window_s,
                                      min_progress=bind_min_progress)
-        dev = up.device
-        self._count = torch.zeros(self.env.num_envs, dtype=torch.long, device=dev)
-        self.slipping_at_cap = torch.zeros(self.env.num_envs, dtype=torch.bool, device=dev)
-        add_post_step(self.env, self._update)
+        self.turn = TurnMonitor(self.env, f"bulb_{i}", lambda: prev._nearest(i)[1], prev.grip,
+                                active_fn=self._slip_check_on, min_rate=min_rate,
+                                slip_ratio=slip_ratio, slip_time=slip_time, boost=boost)
+
+    @property
+    def slipping_at_cap(self):
+        return self.turn.slipping_at_cap
 
     def turn_rates(self):
         """(hand, bulb) angular speeds about the socket axis (rad/s), each (n,)."""
-        _, up = self.prev._nearest(self.i)
-        g = self._hand
-        w_hand = (g.art.data.body_ang_vel_w[:, g.ee_idx] * up).sum(-1)
-        w_bulb = (_obj(self.env, f"bulb_{self.i}").data.root_ang_vel_w * up).sum(-1)
-        return w_hand, w_bulb
+        return self.turn.rates()
 
-    def _update(self) -> None:
-        import torch
-
-        w_hand, w_bulb = self.turn_rates()
-        turning = w_hand.abs() > self.min_rate
-        slip = turning & (w_bulb.abs() < self.slip_ratio * w_hand.abs()) & ~self.prev.seated(self.i)
-        self._count = torch.where(slip, self._count + 1, torch.zeros_like(self._count))
-        due = self._count >= self._slip_steps
-        if bool(due.any()):
-            grip = self.prev.grip
-            if grip.force < grip.force_max - 1e-9:
-                grip.boost(self.boost)  # a little firmer — capped at the glass limit
-            else:
-                self.slipping_at_cap |= due
-            self._count = torch.where(due, torch.zeros_like(self._count), self._count)
+    def _slip_check_on(self) -> list[bool]:
+        held = [o == f"bulb_{self.i}" for o in self.prev._held_obj]
+        return [h and s == "turning" for h, s in zip(held, self.status())]
 
     def status(self) -> list[str]:
         seated = self.prev.seated(self.i)
@@ -286,7 +288,7 @@ class ScrewMonitor:
         for e in range(self.env.num_envs):
             if bool(seated[e]):
                 out.append("seated")
-            elif bool(self.slipping_at_cap[e]):
+            elif bool(self.turn.slipping_at_cap[e]):
                 out.append("slipping_at_cap")
             elif bool(self.bind.stalled[e]):
                 out.append("binding")
@@ -300,6 +302,11 @@ class ScrewMonitor:
 
     def reset(self) -> None:
         """After backing off and re-aligning."""
-        self.slipping_at_cap.zero_()
-        self._count.zero_()
+        self.turn.slipping_at_cap.zero_()
+        self.turn._count.zero_()
         self.bind.reset()
+
+    def close(self) -> None:
+        """Stop watching (unhooks the slip check and the binding monitor)."""
+        self.turn.close()
+        self.bind.close()
