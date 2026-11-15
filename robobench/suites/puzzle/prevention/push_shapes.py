@@ -51,6 +51,8 @@ from typing import TYPE_CHECKING
 
 from robobench.core.prevention import AddedEffort, SpeedGovernor, add_post_step, remove_post_step, _guards, _obj
 
+from robobench.core.prevention import hand_bodies
+
 if TYPE_CHECKING:
     import torch
 
@@ -74,7 +76,7 @@ class PushShapesPrevention:
         self.effort = AddedEffort(env, push_ratio)
         self.speed = SpeedGovernor(env)
         self.speed.add_limit(self._near_seated_limit)
-        self._hands = [(g.art, g.ee_idx) for g in _guards(env) if g.ee_idx is not None]
+        self._hands = hand_bodies(env)
         n = env.num_envs
         self.checked = {k: torch.zeros(n, dtype=torch.bool) for k in PIECES}
         self._was_seated = {k: torch.zeros(n, dtype=torch.bool) for k in PIECES}

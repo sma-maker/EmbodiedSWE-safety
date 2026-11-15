@@ -53,6 +53,8 @@ from typing import TYPE_CHECKING
 from robobench.core.prevention import (CarryPrevention, add_post_step, quat_rotate, quat_rotate_inverse,
                                        required_grip_force, verify_then_approve, _guards, _obj)
 
+from robobench.core.prevention import hand_bodies
+
 if TYPE_CHECKING:
     import torch
 
@@ -72,7 +74,7 @@ class PenHolderPrevention(CarryPrevention):
                  insert_speed: float = 0.05, carry_speed: float = 0.3, carry_height: float = 0.15,
                  tip_clear: float = 0.003, hand_reach: float = 0.12, grip_force_max: float = 30.0,
                  pad_friction: float = PAD_FRICTION,
-                 close_sign: float = -1.0, open_margin: float = 0.003, grip_arms=None) -> None:
+                 close_sign: float | None = None, open_margin: float = 0.003, grip_arms=None) -> None:
         import torch
 
         c = env.scene.cfg
@@ -86,7 +88,7 @@ class PenHolderPrevention(CarryPrevention):
                          grip_arms=grip_arms)
         self.upright_deg, self.opening_margin, self.insert_speed = upright_deg, opening_margin, insert_speed
         self.tip_clear, self.hand_reach = tip_clear, hand_reach
-        self._hands = [(g.art, g.ee_idx) for g in _guards(env) if g.ee_idx is not None]
+        self._hands = hand_bodies(env)
         n, dev = env.num_envs, self.gate_closed.device
         self.oriented_ok = {p: torch.zeros(n, dtype=torch.bool, device=dev) for p in self.pens}
         self.incidents: list[dict] = []
@@ -141,7 +143,8 @@ class PenHolderPrevention(CarryPrevention):
     def _in_cup(self, p_local) -> torch.Tensor:
         """(n,) bool: a holder-frame point is inside the cup (within the inner radius, below the rim)."""
         c = self.scene.cfg
-        return (p_local[:, :2].norm(dim=-1) < c.holder_inner_r) & (p_local[:, 2] < self.rim_z())
+        return ((p_local[:, :2].norm(dim=-1) < c.holder_inner_r) & (p_local[:, 2] < self.rim_z())
+                & (p_local[:, 2] > c.floor_local_z - 0.005))  # above the cup floor (a lifted cup)
 
     def inserted(self, pen: str) -> torch.Tensor:
         """(n,) bool: standing in the cup tip-up the way the rubric counts it."""
@@ -228,7 +231,8 @@ class PenHolderPrevention(CarryPrevention):
                          "a pen went into the cup before its orientation was confirmed")
             tip_w = _obj(self.env, pen).data.root_pos_w + self.axis_w(pen) * self.half_l[pen]
             at_table = (tip_w[:, 2] - self._surface_z() <= self.tip_clear).to(dev)
-            self._report("tip_pressed", pen, present & held & tip_down & at_table,
+            tip_down_w = (self.axis_w(pen)[:, 2] < -0.7071).to(dev)  # pointing down in the world
+            self._report("tip_pressed", pen, present & held & tip_down_w & at_table,
                          "a held pen's tip was pressed against the table")
 
     # -- 3. lowering it in gently ----------------------------------------------------------------

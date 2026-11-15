@@ -36,9 +36,11 @@ __all__ = ["DumplingPrevention"]
 
 
 class DumplingPrevention:
-    def __init__(self, env, edge_min: float = 0.04, punch_tol: float = 0.003, keep_min: float = 0.98,
+    def __init__(self, env, edge_min: float = 0.04, punch_tol: float | None = None, keep_min: float = 0.98,
                  floor_drop: float = 0.05) -> None:
         self.env, self.scene = env, env.scene
+        if punch_tol is None:  # the scene's own punch-through slack (8 mm)
+            punch_tol = float(getattr(env.scene.cfg, "floor_z_slack", 0.008))
         self.edge_min, self.punch_tol, self.keep_min, self.floor_drop = edge_min, punch_tol, keep_min, floor_drop
         self.report = Reporter(env)
         add_post_step(env, self._watch)

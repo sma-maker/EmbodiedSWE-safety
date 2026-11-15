@@ -92,7 +92,7 @@ class EggCartonPrevention(CarryPrevention):
                  place_speed: float = 0.05, carry_speed: float = 0.25, carry_height: float = 0.10,
                  drop_speed: float = 1.0, slip_away: float = 0.02, lid_speed_max: float = 1.0,
                  lid_stop_speed: float = 0.3, lid_slow_deg: float = 15.0, footprint: float = 0.055,
-                 push_ratio: float = 0.25, close_sign: float = -1.0, open_margin: float = 0.003,
+                 push_ratio: float = 0.25, close_sign: float | None = None, open_margin: float = 0.003,
                  grip_arms=None) -> None:
         import torch
 
@@ -102,7 +102,8 @@ class EggCartonPrevention(CarryPrevention):
         self.hold_force = self.hold_N * FINGER_LEVER  # N·m at the finger joints
         self.crush_cap = min(RULE_GRIP_MAX, EGG_CRUSH_N / crush_margin * FINGER_LEVER)
         super().__init__(env, self.hold_force, self.crush_cap, carry_speed=carry_speed, carry_height=carry_height,
-                         close_sign=close_sign, open_margin=open_margin, grip_arms=grip_arms, gate_fingers=False)
+                         close_sign=close_sign, open_margin=open_margin, grip_arms=grip_arms, gate_fingers=False,
+                         grip_in_newtons=False)
         self.release_height, self.place_speed, self.drop_speed = release_height, place_speed, drop_speed
         self.slip_away, self.footprint = slip_away, footprint
         self.lid_speed_max, self.lid_stop_speed, self.lid_slow = lid_speed_max, lid_stop_speed, math.radians(lid_slow_deg)

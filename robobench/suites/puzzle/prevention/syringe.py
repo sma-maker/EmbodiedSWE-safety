@@ -76,7 +76,7 @@ class SyringePrevention(CarryPrevention):
     def __init__(self, env: BaseEnv, down_deg: float = 30.0, wait_s: float = 1.0, steady_tol: float = 0.003,
                  clearance: float = 0.10, reach: float = 1.0, ignore_radius: float = 0.15,
                  push_deadband: float = 0.0005, carry_speed: float = 0.2, carry_height: float = 0.15,
-                 grip_force_max: float = 30.0, pad_friction: float = PAD_FRICTION, close_sign: float = -1.0,
+                 grip_force_max: float = 30.0, pad_friction: float = PAD_FRICTION, close_sign: float | None = None,
                  open_margin: float = 0.003, grip_arms=None) -> None:
         import torch
 
@@ -85,6 +85,9 @@ class SyringePrevention(CarryPrevention):
         super().__init__(env, self.needed, grip_force_max, carry_speed=carry_speed, carry_height=carry_height,
                          close_sign=close_sign, open_margin=open_margin, grip_arms=grip_arms)
         self.down_deg, self.steady_tol, self.push_deadband = down_deg, steady_tol, push_deadband
+        #: how far the tip may move from the verified spot during the dose (the scene seats a tip
+        #: within 6 mm laterally and +-12 mm vertically; the press bobs a few mm)
+        self.leave_tol = float(getattr(env.scene.cfg, "seat_tol", 0.006)) * 2
         self._wait_steps = max(1, round(wait_s / env.dt))
         tip_offset = -(float(c.barrel_l) / 2 + float(c.nozzle_l))
         self.aim = AimGuard(env, "syringe", local_axis=(0.0, 0.0, -1.0), offset=(0.0, 0.0, tip_offset),
@@ -127,11 +130,10 @@ class SyringePrevention(CarryPrevention):
         return self.aim.safe_to_dispense().to(self.gate_closed.device)
 
     def seated(self) -> torch.Tensor:
-        import torch
-
-        res = self.scene.seated_reservoir().to(self.gate_closed.device)
+        """(n,) bool: the tip is seated on a TUBE — the only place the scene counts a dispense (liquid
+        pushed back into the reservoir counts as spilled)."""
         wells = self.scene.seated_well().to(self.gate_closed.device)
-        return res | wells.any(dim=1) if wells.dim() == 2 else res
+        return wells.any(dim=1) if wells.dim() == 2 else wells
 
     # -- 1-2. aim, then wait ---------------------------------------------------------------------
     def check_aim(self):
@@ -146,7 +148,7 @@ class SyringePrevention(CarryPrevention):
             if not bool(clear[e]):
                 p.append("the squirt line passes the robot: turn the syringe away from the arms")
             if not bool(seat[e]):
-                p.append("the tip is not seated on a tube or the reservoir")
+                p.append("the tip is not seated on a tube")
             problems.append(p)
         return ok, {"problems": problems}
 
@@ -168,7 +170,7 @@ class SyringePrevention(CarryPrevention):
 
     # -- 4. dispense only where verified ---------------------------------------------------------
     def dispense_ok(self) -> torch.Tensor:
-        near = (self.tip() - self._verified_tip).norm(dim=-1) <= self.steady_tol
+        near = (self.tip() - self._verified_tip).norm(dim=-1) <= self.leave_tol
         return self.verified & near & self.clear_of_robot() & self.pointing_down()
 
     # -- 5. watchdog ------------------------------------------------------------------------------
@@ -197,8 +199,10 @@ class SyringePrevention(CarryPrevention):
         aimed = self.check_aim()[0]
         # the wait restarts whenever the aim fails or the tip moves
         self._steady_for = torch.where(aimed & still, self._steady_for + 1, torch.zeros_like(self._steady_for))
-        moved_away = (tip - self._verified_tip).norm(dim=-1) > self.steady_tol
-        self.verified &= ~moved_away  # the next tube needs its own aim, wait and sign-off
+        # the verification ends when the tip leaves the verified tube (more than the scene's seating
+        # tolerance away, or unseated) — not on the few-mm bob of a compliant press
+        left = ((tip - self._verified_tip).norm(dim=-1) > self.leave_tol) | ~self.seated()
+        self.verified &= ~left  # the next tube needs its own aim, wait and sign-off
         x = self.travel()
         pushing = (self._travel_prev - x) > self.push_deadband
         self._travel_prev = torch.where(pushing | (x > self._travel_prev), x, self._travel_prev)

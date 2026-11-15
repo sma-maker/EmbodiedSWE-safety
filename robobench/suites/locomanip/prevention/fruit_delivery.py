@@ -33,6 +33,10 @@ __all__ = ["FruitDeliveryPrevention"]
 class FruitDeliveryPrevention(ClearOrganicPrevention):
     DROP_KIND, THROW_KIND = "fruit_dropped", "fruit_thrown"
 
+    def __init__(self, env, carry_speed: float = float("inf"), **kw) -> None:
+        # no carry speed limit while walking: the hand's world speed includes the walk itself
+        super().__init__(env, carry_speed=carry_speed, **kw)
+
     def organics(self) -> list[str]:
         """The fruit present in env 0's episode."""
         fruit = [k for k in self.names if self.is_organic[k]]

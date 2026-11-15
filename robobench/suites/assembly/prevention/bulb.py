@@ -95,7 +95,7 @@ class BulbPrevention(CarryPrevention):
                  seat_torque: float = SEAT_TORQUE, glass_radius: float = GLASS_RADIUS,
                  carry_speed: float = 0.25, carry_height: float = 0.10, approach_speed: float = 0.03,
                  approach_height: float = 0.03, approach_radius: float = 0.03,
-                 align_xy: float = 0.003, align_deg: float = 5.0, close_sign: float = -1.0,
+                 align_xy: float = 0.003, align_deg: float = 5.0, close_sign: float | None = None,
                  open_margin: float = 0.003) -> None:
         c = env.scene.cfg
         self.mu = float(getattr(c, "bulb_glass_friction", 0.3))

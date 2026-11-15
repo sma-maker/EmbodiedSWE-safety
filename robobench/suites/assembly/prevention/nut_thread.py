@@ -89,7 +89,7 @@ class NutThreadPrevention(CarryPrevention):
     def __init__(self, env: BaseEnv, grip_force_max: float = 30.0, carry_speed: float = 0.25,
                  carry_height: float = 0.10, approach_speed: float = 0.03, approach_height: float = 0.02,
                  approach_radius: float = 0.02, align_xy: float = 0.0015, align_deg: float = 3.0,
-                 entry_tol: float = 0.004, drive_effort_ratio: float = 0.5, close_sign: float = -1.0,
+                 entry_tol: float = 0.004, drive_effort_ratio: float = 0.5, close_sign: float | None = None,
                  open_margin: float = 0.003, grip_arms=None) -> None:
         import torch
 

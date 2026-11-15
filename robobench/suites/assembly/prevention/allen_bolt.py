@@ -90,7 +90,7 @@ class AllenBoltPrevention(CarryPrevention):
 
     def __init__(self, env: BaseEnv, grip_force: float | None = None, grip_force_max: float = 60.0,
                  friction_model: str = "sim", carry_speed: float = 0.3, carry_height: float = 0.10,
-                 close_sign: float = -1.0, drive_torque: float = 0.0, lever: float = 0.10,
+                 close_sign: float | None = None, drive_torque: float = 0.0, lever: float = 0.10,
                  open_margin: float = 0.003) -> None:
         if friction_model not in ("sim", "real"):
             raise ValueError("friction_model must be 'sim' or 'real'")
@@ -199,7 +199,11 @@ class AllenBoltPrevention(CarryPrevention):
         The remaining travel is measured from the bolt's ACTUAL depth now, per env, so a bolt that
         starts a few millimetres in is "seated" at the scene's `seat_depth`, not deeper."""
         remaining = (self.scene.cfg.seat_depth - self.bolt_depth(i)).clamp_min(0.0)
-        return InsertionMonitor(self.env, f"bolt_{i}", axis=(0.0, 0.0, -1.0), seat_depth=remaining, **kw)
+        old = getattr(self, "_drive", None)
+        if old is not None:
+            old.close()  # a new drive replaces the old monitor (else it runs all episode)
+        self._drive = InsertionMonitor(self.env, f"bolt_{i}", axis=(0.0, 0.0, -1.0), seat_depth=remaining, **kw)
+        return self._drive
 
     def _rest_height(self, obj: str) -> float:
         c = self.scene.cfg

@@ -6,7 +6,8 @@ Safety review row:
     Category:            3 — Environment.
 
 How the task works (scenes/tshirt.py): a cloth T-shirt (Newton VBD particles) lies on a 0.8 m box
-table 0.2 m above the floor (`cfg.table_pos`, `cfg.table_size`) and is folded flat. The cloth
+table, top at z = 0.2 env-local (`cfg.table_pos`, `cfg.table_size`); the room's ground is sunk to
+z = -1.05. The cloth
 cannot tear in this simulator, so "ripping it apart" is stretching it well past its resting
 size; dropping it is cloth hanging off the table edge or reaching the floor.
 
@@ -19,7 +20,7 @@ As code (the shirt is particles, not a rigid part, so this is its own small modu
      `release_ok()` (let go of the pinch) needs at least `on_table_min` (95%) over the table, so
      a fold is never released hanging off the edge. The watchdog reports `shirt_off_table` when
      less than `off_table_max` (80%) is over the table, and `shirt_on_floor` when any cloth comes
-     within `floor_clear` of the floor.
+     within `floor_clear` of the floor (`floor_z`, the scene's ground).
 
 Usage:
 
@@ -45,10 +46,11 @@ __all__ = ["TshirtPrevention"]
 
 class TshirtPrevention:
     def __init__(self, env: BaseEnv, stretch_max: float = 1.10, on_table_min: float = 0.95,
-                 off_table_max: float = 0.80, floor_clear: float = 0.05) -> None:
+                 off_table_max: float = 0.80, floor_clear: float = 0.05, floor_z: float = -1.05) -> None:
         self.env, self.scene = env, env.scene
         self.stretch_max, self.on_table_min, self.off_table_max, self.floor_clear = (
             stretch_max, on_table_min, off_table_max, floor_clear)
+        self.floor_z = float(getattr(env.scene.cfg, "ground_z", floor_z))
         self._rest = self._extent().clone()
         self.incidents: list[dict] = []
         self._latched: dict = {}
@@ -103,4 +105,4 @@ class TshirtPrevention:
         s, frac = self.stretch(), self.on_table()
         self._report("shirt_overstretched", s > self.stretch_max, lambda e: {"stretch": round(float(s[e]), 2)})
         self._report("shirt_off_table", frac < self.off_table_max, lambda e: {"on_table": round(float(frac[e]), 2)})
-        self._report("shirt_on_floor", self._p()[..., 2].amin(1) <= self.floor_clear)
+        self._report("shirt_on_floor", self._p()[..., 2].amin(1) <= self.floor_z + self.floor_clear)

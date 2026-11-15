@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 
 from robobench.core.prevention import CarryPrevention, add_post_step, quat_rotate, required_grip_force, _guards, _obj
 
+from robobench.core.prevention import hand_bodies
+
 if TYPE_CHECKING:
     import torch
 
@@ -38,7 +40,7 @@ class KnifePrevention(CarryPrevention):
         self.slip_tol, self.slip_deg, self.cut_speed, self.near_board = slip_tol, slip_deg, cut_speed, near_board
         self.drop_speed, self.hand_reach = drop_speed, hand_reach
         self.secure = torch.zeros(env.num_envs, dtype=torch.bool)
-        self._hands = [(g.art, g.ee_idx) for g in _guards(env) if g.ee_idx is not None]
+        self._hands = hand_bodies(env)
         self.incidents: list[dict] = []
         self._latched: dict = {}
         self._kstep = 0

@@ -63,11 +63,12 @@ class LattePrevention:
         return self.report.incidents
 
     # -- vessel geometry -------------------------------------------------------------------------
+    # (all bookkeeping on the CPU: the scene's poses live on the sim device)
     def mug_pos(self):
-        return t(self.scene.mug_pose_w)[:, :3]
+        return t(self.scene.mug_pose_w)[:, :3].cpu()
 
     def pitcher_up(self):
-        q = wxyz(t(self.scene.pitcher_pose_w)[:, 3:])
+        q = wxyz(t(self.scene.pitcher_pose_w)[:, 3:].cpu())
         return quat_rotate(q, q.new_tensor((0.0, 0.0, 1.0)).expand(q.shape[0], 3))
 
     def pitcher_tilt_deg(self):
@@ -76,14 +77,14 @@ class LattePrevention:
         return torch.rad2deg(torch.arccos(self.pitcher_up()[:, 2].clamp(-1.0, 1.0)))
 
     def lip(self):
-        """(n, 3) the pour lip: the rim's low point, toward the side the pitcher is tipped."""
-        import torch
-
+        """(n, 3) the pour lip: the LOWEST point of the rim circle — world-down projected onto the
+        rim plane (the rim tilts with the pitcher, so the lip is not simply out to the side)."""
         c = self.scene.cfg
-        base, up = t(self.scene.pitcher_pose_w)[:, :3], self.pitcher_up()
-        side = up[:, :2] / up[:, :2].norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        side3 = torch.cat([side, torch.zeros_like(side[:, :1])], dim=1)
-        return base + up * c.pitcher_h + side3 * c.pitcher_r
+        base, up = t(self.scene.pitcher_pose_w)[:, :3].cpu(), self.pitcher_up()
+        down = up.new_tensor((0.0, 0.0, -1.0)).expand_as(up)
+        d = down - (down * up).sum(-1, keepdim=True) * up  # world-down, within the rim plane
+        d = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return base + up * c.pitcher_h + d * c.pitcher_r
 
     # -- 1. sense, then confirm ------------------------------------------------------------------
     def locate_cup(self):
@@ -111,7 +112,7 @@ class LattePrevention:
         lip, mug = self.lip(), self.mug_pos()
         out = torch.zeros(self.env.num_envs, dtype=torch.bool)
         for art in self._arts:
-            p = t(art.data.body_pos_w)
+            p = t(art.data.body_pos_w).cpu()
             near = (p[..., :2] - lip[:, None, :2]).norm(dim=-1) < 0.05
             below = (p[..., 2] < lip[:, None, 2]) & (p[..., 2] > mug[:, None, 2])
             out |= (near & below).any(dim=1).cpu()
@@ -131,7 +132,7 @@ class LattePrevention:
         milk = t(self.scene.milk.data.nodal_pos_w)  # (n, P, 3) world
         out = torch.zeros(self.env.num_envs, dtype=torch.bool)
         for art in self._arts:
-            b = t(art.data.body_pos_w)  # (n, B, 3)
+            b = t(art.data.body_pos_w).to(milk.device)  # (n, B, 3), on the milk's device
             d = torch.cdist(b, milk)  # (n, B, P)
             out |= (d.amin(dim=(1, 2)) < self.touch_dist).cpu()
         return out

@@ -72,9 +72,9 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from robobench.core.prevention import (CarryPrevention, InsertionMonitor, add_post_step, quat_rotate,
-                                       quat_rotate_inverse, remove_post_step, required_grip_force,
-                                       verify_then_approve, _guards, _obj)
+from robobench.core.prevention import (CarryPrevention, InsertionMonitor, TurnMonitor, parallel_grippers,
+                                       quat_rotate, quat_rotate_inverse, required_grip_force,
+                                       verify_then_approve, _obj)
 
 if TYPE_CHECKING:
     import torch
@@ -106,15 +106,18 @@ class IkeaTablePrevention(CarryPrevention):
                  approach_height: float = 0.03, approach_radius: float = 0.03,
                  align_xy: float = 0.003, align_deg: float = 3.0, entry_tol: float = 0.006,
                  table_move_tol: float = 0.005, table_tilt_deg: float = 2.0,
-                 drive_effort_ratio: float = 0.6, close_sign: float = -1.0,
+                 drive_effort_ratio: float = 0.6, close_sign: float | None = None,
                  open_margin: float = 0.003, grip_arms=None, slab_half: float = 0.275) -> None:
         import torch
 
         self.needed = required_grip_force(LEG_MASS, shaft_friction)
+        if not parallel_grippers(env):  # a multi-finger hand (G1 / GR1T2): joint N·m, rated 1.4
+            self.needed *= 0.04  # pad force x a ~4 cm finger lever (assumption)
+            grip_force_max = min(grip_force_max, 1.4)
         force = grip_force if grip_force is not None else self.needed
         super().__init__(env, force, grip_force_max, carry_speed=carry_speed,
                          carry_height=carry_height, close_sign=close_sign, open_margin=open_margin,
-                         grip_arms=grip_arms)
+                         grip_arms=grip_arms, grip_in_newtons=False)
         self.approach_speed, self.approach_height = approach_speed, approach_height
         self.approach_radius, self.align_xy, self.align_deg = approach_radius, align_xy, align_deg
         self.entry_tol, self.table_move_tol, self.table_tilt_deg = entry_tol, table_move_tol, table_tilt_deg
@@ -327,6 +330,16 @@ class IkeaTablePrevention(CarryPrevention):
         return {"set_N": round(self.grip.force, 2), "max_N": self.grip.force_max,
                 "required_N_to_hold_leg": round(self.needed, 2)}
 
+    def released(self, obj: str, envs=None) -> None:
+        """Back to the holding grip once nothing is held — unless the leg was let go part-way onto
+        its stud (a re-grip), when the grip it needed to turn is kept for the next close."""
+        super().released(obj, envs)
+        if bool(self.carrying().any()) or not obj.startswith("leg_"):
+            return
+        i = int(obj.split("_")[1])
+        if not bool((self.threaded(i) & ~self.seated(i)).any()):
+            self.grip.force = self.needed
+
 
 class LegDrive:
     """Watches leg `i` being screwed onto its approved stud. Status per env, in priority order:
@@ -362,23 +375,23 @@ class LegDrive:
             self.env, f"leg_{i}", axis=-self._table_up0, seat_depth=remaining,
             effort_ratio=prev.drive_effort_ratio if effort_ratio is None else effort_ratio,
             window_s=window_s, min_progress=min_progress)
-        # rotational slip: the hand nearest the leg (per env) must turn the leg with it
-        self._hands = [g for g in _guards(self.env) if g.ee_idx is not None]
-        if not self._hands:
-            raise ValueError("no end-effector body found to measure the turn against")
-        leg = _obj(self.env, f"leg_{i}").data.root_pos_w
-        d = torch.stack([(g.art.data.body_pos_w[:, g.ee_idx] - leg).norm(dim=-1) for g in self._hands], 1)
-        self._hand = d.argmin(dim=1)  # (n,)
-        self.min_rate, self.slip_ratio, self.boost = min_rate, slip_ratio, boost
-        self._slip_steps = max(1, round(slip_time / self.env.dt))
-        dev = leg.device
-        self._count = torch.zeros(self.env.num_envs, dtype=torch.long, device=dev)
-        self.slipping_at_cap = torch.zeros(self.env.num_envs, dtype=torch.bool, device=dev)
-        add_post_step(self.env, self._update)
+        # rotational slip, judged only while the fingers hold the leg: turning the wrist back with
+        # the fingers open (a re-grip — a leg takes ~7 turns) is not slip
+        self.turn = TurnMonitor(self.env, f"leg_{i}", lambda: prev.table_up(), prev.grip,
+                                active_fn=self._slip_check_on, min_rate=min_rate, slip_ratio=slip_ratio,
+                                slip_time=slip_time, boost=boost)
+
+    @property
+    def slipping_at_cap(self):
+        return self.turn.slipping_at_cap
+
+    def _slip_check_on(self) -> list[bool]:
+        held = [o == f"leg_{self.i}" for o in self.prev._held_obj]
+        return [h and s == "driving" for h, s in zip(held, self.status())]
 
     def close(self) -> None:
         """Stop watching (unhooks the slip check and the stall monitor)."""
-        remove_post_step(self.env, self._update)
+        self.turn.close()
         self.insert.close()
 
     def table_moved(self) -> torch.Tensor:
@@ -392,31 +405,7 @@ class LegDrive:
 
     def turn_rates(self):
         """(hand, leg) angular speeds about the stud axis (rad/s), each (n,)."""
-        import torch
-
-        up = self.prev.table_up()
-        w = torch.stack([g.art.data.body_ang_vel_w[:, g.ee_idx] for g in self._hands], 1)  # (n, H, 3)
-        rows = torch.arange(w.shape[0], device=w.device)
-        w_hand = (w[rows, self._hand.to(w.device)] * up).sum(-1)
-        leg = _obj(self.env, f"leg_{self.i}").data
-        w_leg = (leg.root_ang_vel_w * up).sum(-1)
-        return w_hand, w_leg
-
-    def _update(self) -> None:
-        import torch
-
-        w_hand, w_leg = self.turn_rates()
-        driving = torch.tensor([s == "driving" for s in self.status()], device=w_hand.device)
-        slip = driving & (w_hand.abs() > self.min_rate) & (w_leg.abs() < self.slip_ratio * w_hand.abs())
-        self._count = torch.where(slip, self._count + 1, torch.zeros_like(self._count))
-        due = self._count >= self._slip_steps
-        if bool(due.any()):
-            grip = self.prev.grip
-            if grip.force < grip.force_max - 1e-9:
-                grip.boost(self.boost)  # a little firmer, never past grip_force_max
-            else:
-                self.slipping_at_cap |= due
-            self._count = torch.where(due, torch.zeros_like(self._count), self._count)
+        return self.turn.rates()
 
     def status(self) -> list[str]:
         p = self.prev

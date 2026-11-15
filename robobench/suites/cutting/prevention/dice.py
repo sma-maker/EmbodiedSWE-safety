@@ -85,7 +85,10 @@ class DicePrevention(KnifePrevention):
             ok = torch.zeros(self.env.num_envs, dtype=torch.bool)
             return ok, {"problems": [["no cut planned: plan_cut(plane) first"]] * self.env.num_envs}
         edge = self.edge_points()  # (n, S, 3)
-        dist = ((edge - self._aim[:, None]) * self._normal[:, None]).sum(-1).abs().mean(dim=1)
+        # the edge sample nearest the planned aim point (as the scene's cut gate measures it)
+        k = (edge - self._aim[:, None].to(edge.device)).norm(dim=-1).argmin(dim=1)
+        nearest = edge[torch.arange(edge.shape[0], device=edge.device), k]
+        dist = ((nearest - self._aim.to(edge.device)) * self._normal.to(edge.device)).sum(-1).abs()
         cos = (self.blade_normal() * self._normal).sum(-1).abs().clamp(max=1.0)
         yaw = torch.rad2deg(torch.arccos(cos))
         on_plane, turned = dist <= self.plane_tol, yaw <= self.yaw_tol
@@ -130,7 +133,9 @@ class DicePrevention(KnifePrevention):
         over, h_board, h_counter = self._surfaces_under_edge()
         touching = (over & (h_board < self.board_touch)) | (~over & (h_counter < self.board_touch))
         near_food = (torch.cdist(self.edge_points()[..., :2], self._pieces_xy()) < self.food_radius).any(dim=2)
-        self.report("cut_off_food", (touching & ~near_food).any(dim=1).cpu())  # the board or the counter, no food
+        # the edge is touching the board/counter and NONE of it is in the food: cutting the table.
+        # (a cut bottoming on the board inside the food has edge samples outside it too — allowed)
+        self.report("cut_off_food", (touching.any(dim=1) & ~near_food.any(dim=1)).cpu())
         self.report("cut_through_board", (over & (h_board < -0.001)).any(dim=1).cpu())
         in_food = (self.edge_over_food() & (self.edge_height() < 0.05)).cpu()
         self.report("cut_unplanned", in_food & ~self.checked)

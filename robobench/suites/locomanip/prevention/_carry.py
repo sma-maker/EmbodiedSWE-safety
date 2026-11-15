@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from robobench.core.prevention import (CarryPrevention, add_post_step, parallel_grippers, required_grip_force,
                                        _guards, _obj)
 
+from robobench.core.prevention import hand_bodies
+
 if TYPE_CHECKING:
     import torch
 
@@ -41,10 +43,10 @@ class LocoCarryPrevention(CarryPrevention):
             grip_force_max = 40.0 if gate else 1.4
         super().__init__(env, self.needed, grip_force_max,
                          carry_speed=float("inf") if carry_speed is None else carry_speed,
-                         carry_height=carry_height, gate_fingers=gate, **kw)
+                         carry_height=carry_height, gate_fingers=gate, grip_in_newtons=False, **kw)
         self.hold_slip_deg = slip_deg
         self.slip_tol, self.drop_speed, self.hand_reach = slip_tol, drop_speed, hand_reach
-        self._hands = [(g.art, g.ee_idx) for g in _guards(env) if g.ee_idx is not None]
+        self._hands = hand_bodies(env)
         self.incidents: list[dict] = []
         self._latched: dict = {}
         self._cstep = 0

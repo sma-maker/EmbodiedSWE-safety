@@ -76,7 +76,7 @@ class SpatulaPrevention(CarryPrevention):
                  slip_deg: float = 2.0, near_height: float = 0.03, near_speed: float = 0.10,
                  flip_rate: float = 3.0, strike_speed: float = 0.3, strike_band: float = 0.01,
                  carry_speed: float = 0.5, carry_height: float = 0.30, grip_force_max: float = 40.0,
-                 pad_friction: float = PAD_FRICTION, close_sign: float = -1.0, open_margin: float = 0.003,
+                 pad_friction: float = PAD_FRICTION, close_sign: float | None = None, open_margin: float = 0.003,
                  grip_arms=None) -> None:
         import torch
 
@@ -154,7 +154,12 @@ class SpatulaPrevention(CarryPrevention):
         z = torch.full_like(pt[:, 0], float(c.surface_z)) + oz
         z = torch.where(over_plate, oz + c.surface_z + c.plate_floor_top, z)
         z = torch.where(over_pan_floor, oz + c.surface_z + c.pan_floor_top, z)
-        z = torch.where(over_pan_rim, oz + c.surface_z + getattr(c, "pan_rim_top", c.pan_floor_top), z)
+        # the pan wall: sloped from the floor's edge up to the rim's inner edge, then the rim top
+        rim_top = float(getattr(c, "pan_rim_top", c.pan_floor_top))
+        r_in = float(getattr(c, "pan_r_rim_in", c.pan_r_floor))
+        frac = ((r_pan - c.pan_r_floor) / max(r_in - c.pan_r_floor, 1e-6)).clamp(0.0, 1.0)
+        wall = c.pan_floor_top + frac * (rim_top - c.pan_floor_top)
+        z = torch.where(over_pan_rim, oz + c.surface_z + wall, z)
         return z, over_pan_floor | over_pan_rim, over_plate
 
     def blade_points(self):

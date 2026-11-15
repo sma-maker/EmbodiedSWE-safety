@@ -733,6 +733,7 @@ class IkeaTableTests(unittest.TestCase):
         leg = legs["leg_0"]
         put_leg(leg, stud=0)
         self.assertTrue(prev.verify_leg(0))
+        prev.mark_held("leg_0")  # the leg is in the fingers
         drive = prev.drive(0, slip_time=0.01)
         env.robot.articulation.data.body_ang_vel_w[:, 1, 2] = 1.0  # the hand turns, the leg does not
         forces = []
@@ -1729,6 +1730,7 @@ def mb_env(n=2):
     cfg = SimpleNamespace(surface_z=0.0, num_holes=7, hole_xy=HOLES, board_top=0.0, seat_depth=0.011,
                           align_xy=0.003, align_axis_deg=5.0, key_mass=0.10, bolt_mass=0.012,
                           key_init_z=0.004, key_init_quat=(0.70711, 0.70711, 0.0, 0.0),
+                          key_init_xy=(0.24, 0.38), workbench_pos=(0.5, 0.0),
                           bolt_init_z=0.0065, bolt_init_quat=(0.70711, 0.0, 0.70711, 0.0))
     case = rigid(n, pos=CASE)
     bolts = {}
@@ -2160,7 +2162,7 @@ class ToolPackingTests(unittest.TestCase):
         q, v = box.data.joint_pos, box.data.joint_vel
         v[:, 0] = -0.1  # pulling out at 10 cm/s, mid-travel
         self.assertEqual(move.scale().tolist(), [1.0, 1.0])
-        v[:, 0] = -0.27  # 90% of the 0.3 m/s limit
+        v[:, 0] = -0.225  # 90% of the 0.25 m/s limit (kept under the 0.3 rule)
         self.assertAlmostEqual(float(move.scale()[0]), 0.333, places=2)
         q[:, 0] = -0.10  # 1.8 cm from the stop: allowed 5 cm/s now
         v[:, 0] = -0.04
@@ -2188,9 +2190,9 @@ class ToolPackingTests(unittest.TestCase):
         prev = ToolPackingPrevention(env)
         box.data.joint_pos[:, 2] = -0.05
         move = prev.close_drawer("third")
-        box.data.joint_vel[:, 2] = 0.2  # pushing in at 20 cm/s, 5 cm out: fine
+        box.data.joint_vel[:, 2] = 0.15  # pushing in at 15 cm/s, 5 cm out: fine
         self.assertEqual(move.scale().tolist(), [1.0, 1.0])
-        box.data.joint_pos[:, 2] = -0.015  # 1.5 cm from shut at 20 cm/s: must slow to 5 cm/s
+        box.data.joint_pos[:, 2] = -0.015  # 1.5 cm from shut at 15 cm/s: must slow to 5 cm/s
         self.assertEqual(move.scale().tolist(), [0.0, 0.0])
 
     def test_a_drawer_slammed_into_its_stop_is_reported(self):
@@ -2519,7 +2521,7 @@ class CoffeeTests(unittest.TestCase):
         flags["pod_seated"][1] = False  # env 1: no pod
         ok, info = prev.check_brew()
         self.assertEqual(ok.tolist(), [False, False])
-        self.assertIn("mug 3.0 cm off the spout axis", info["problems"][0][0])
+        self.assertIn("mug 3.0 cm off its spot under the spout", info["problems"][0][0])
         self.assertIn("no pod seated", info["problems"][1][0])
         cup.data.root_pos_w[0, 0] -= 0.03
         flags["pod_seated"][1] = True
@@ -2810,7 +2812,7 @@ class SyringeTests(unittest.TestCase):
         self.assertTrue(prev.verify_aim())
         self.assertEqual(asked, [APPROVAL])
         self.assertTrue(bool(prev.dispense_ok().all()))
-        syr.data.root_pos_w[0, 0] += 0.01  # env 0 moves to another spot: the verification ends
+        syr.data.root_pos_w[0, 0] += 0.02  # env 0 moves off the tube (2 cm): the verification ends
         substep(env)
         self.assertEqual(prev.dispense_ok().tolist(), [False, True])
 
@@ -3077,7 +3079,7 @@ class StackTshirtTests(unittest.TestCase):
         self.assertEqual(prev.release_ok().tolist(), [True, True])
         nodes[0, :, 0] *= 1.2  # env 0: stretched 20% wide
         nodes[1, :, 1] -= 0.4  # env 1: the whole shirt slid most of the way off the table edge ...
-        nodes[1, :20, 2] = 0.02  # ... its far end hanging down to the floor
+        nodes[1, :20, 2] = -1.03  # ... its far end hanging down to the floor (the ground is at -1.05)
         substep(env)
         self.assertEqual(prev.pull_ok().tolist(), [False, True])  # sliding is not stretching
         self.assertFalse(bool(prev.release_ok()[1]))
@@ -3477,3 +3479,251 @@ class CarryCapTests(unittest.TestCase):
         wheel.data.root_pos_w[:, 2] -= 0.02  # it slides in the fingers
         substep(env)
         self.assertGreater(prev.grip.force, f0)
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class ReviewFixTests(unittest.TestCase):
+    """Bugs found in the full review of all 28 tasks."""
+
+    def test_ikea_regrip_with_open_fingers_is_not_slip(self):
+        from robobench.suites.assembly.prevention.ikea_table import IkeaTablePrevention
+
+        env, _, legs = ikea_env()
+        prev = IkeaTablePrevention(env)
+        put_leg(legs["leg_0"], stud=0)
+        self.assertTrue(prev.verify_leg(0))
+        drive = prev.drive(0, slip_time=0.01)  # the leg is NOT in the fingers (opened to re-grip)
+        env.robot.articulation.data.body_ang_vel_w[:, 1, 2] = -2.0  # the wrist swings back
+        for _ in range(30):
+            substep(env)
+        self.assertAlmostEqual(prev.grip.force, prev.needed)
+        self.assertEqual(drive.status(), ["driving"] * 2)
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class ReviewFixTests2(unittest.TestCase):
+    def test_coffee_mug_is_centred_on_the_staged_spot_not_the_unreachable_axis(self):
+        from robobench.suites.puzzle.prevention.coffee import CoffeePrevention
+
+        env, cup, flags = coffee_env()
+        env.scene.cfg.cup_stage_y_off = -0.040  # the scene's staged point, 4 cm south of the axis
+        prev = CoffeePrevention(env)
+        self.assertFalse(bool(prev.check_brew()[0].any()))  # centred on the axis is not reachable
+        cup.data.root_pos_w[:, 1] -= 0.040  # stood where the scene stages it
+        self.assertEqual(prev.check_brew()[0].tolist(), [True, True])
+
+    def test_syringe_press_bob_keeps_the_verification(self):
+        from robobench.suites.puzzle.prevention.syringe import SyringePrevention
+
+        env, syr, state, half = syringe_env()
+        prev = SyringePrevention(env, wait_s=0.05)
+        aim_at_tube(syr, half)
+        state["wells"][:, 0] = True
+        for _ in range(6):
+            substep(env)
+        self.assertTrue(prev.verify_aim())
+        syr.data.root_pos_w[:, 2] -= 0.004  # pressing the plunger bobs the barrel 4 mm into the tube
+        substep(env)
+        self.assertTrue(bool(prev.dispense_ok().all()))
+
+    def test_stack_lowering_then_lifting_a_block_is_not_the_tower_falling(self):
+        from robobench.suites.puzzle.prevention.stack_blocks import StackPrevention
+
+        env, blocks = stack_env()
+        stack_on(blocks["block_0"], 0)
+        prev = StackPrevention(env)
+        hand = env.robot.articulation.data.body_pos_w
+        b1 = blocks["block_1"]
+        stack_on(b1, 1, dz=0.008)  # lowered into slot 1's window, still in the hand ...
+        hand[:, 1] = b1.data.root_pos_w + torch.tensor([0.0, 0.0, 0.10])
+        substep(env)
+        b1.data.root_pos_w[:, 2] += 0.05  # ... lifted to re-align
+        hand[:, 1, 2] += 0.05
+        substep(env)
+        self.assertEqual(prev.incidents, [])
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class ReviewFixTests3(unittest.TestCase):
+    def test_tshirt_hanging_below_the_table_is_not_on_the_floor(self):
+        from robobench.suites.deformable.prevention.tshirt import TshirtPrevention
+
+        env = prev_env(2)
+        xs, ys = torch.meshgrid(torch.linspace(-0.25, 0.25, 11), torch.linspace(-0.75, -0.25, 11), indexing="ij")
+        nodes = torch.stack([xs.flatten(), ys.flatten(), torch.full((121,), 0.205)], dim=1)[None].repeat(2, 1, 1)
+        env.scene = SimpleNamespace(cfg=SimpleNamespace(table_pos=(0.0, -0.5, 0.1), table_size=(0.8, 0.8, 0.2)),
+                                    nodal_pos_local=lambda: nodes)
+        prev = TshirtPrevention(env)
+        nodes[:, :5, 2] = 0.03  # a corner draped 17 cm down the table's side: not the floor
+        substep(env)
+        self.assertNotIn("shirt_on_floor", [i["kind"] for i in prev.incidents])
+
+    def test_latte_lip_is_the_rims_low_point(self):
+        from robobench.suites.deformable.prevention.latte import LattePrevention
+
+        env, _ = latte_env()
+        prev = LattePrevention(env)
+        s = math.sqrt(0.5)  # tipped 90 deg about y (up-axis toward -x), base at the origin of the pitcher
+        env.scene.pitcher_pose_w[:] = torch.tensor([0.0, 0.0, 0.20, 0.0, -s, 0.0, s])
+        lip = prev.lip()[0]
+        # rim centre 9.27 cm out along -x; the low point is 3 cm straight DOWN from it, not out sideways
+        self.assertTrue(torch.allclose(lip, torch.tensor([-0.0927, 0.0, 0.17]), atol=1e-4))
+
+    def test_dice_bottoming_inside_the_food_is_not_cutting_the_table(self):
+        from robobench.suites.cutting.prevention.dice import DicePrevention
+
+        env, knife = DiceFruitTests()._dice_env()
+        prev = DicePrevention(env)
+        # heel in the food (x=0), tip 20 cm on, past the food, touching the board: one cut that has
+        # bottomed out — the old per-point test flagged the tip as "cutting the board"
+        knife.data.root_pos_w[:] = torch.tensor([0.0, 0.015, 0.882 + 0.13 + 0.001])
+        edge = prev.edge_points()[0]
+        self.assertLess(float((edge[0, :2] - torch.tensor([0.0, 0.0])).norm()), prev.food_radius)  # heel in food
+        self.assertLess(float(edge[-1, 2]) - 0.882, prev.board_touch)  # tip on the board
+        substep(env)
+        self.assertNotIn("cut_off_food", [i["kind"] for i in prev.incidents])
+        knife.data.root_pos_w[:] = torch.tensor([0.10, -0.10, 0.882 + 0.13 + 0.001])  # wholly off the food
+        substep(env)
+        self.assertIn("cut_off_food", [i["kind"] for i in prev.incidents])
+
+
+# ----- shared fixes from the full review ----------------------------------------------------------
+def fake_art(n, joints, lo, hi, default, bodies, body_pos=None):
+    """A minimal articulation: named joints with limits and a default (= open-gripper) pose."""
+    J = len(joints)
+    lo_t, hi_t, q0 = torch.tensor(lo), torch.tensor(hi), torch.tensor(default)
+    d = SimpleNamespace(
+        joint_pos=q0.repeat(n, 1).clone(), joint_vel=torch.zeros(n, J), applied_torque=torch.zeros(n, J),
+        joint_pos_limits=torch.stack([lo_t, hi_t], -1).repeat(n, 1, 1), joint_vel_limits=torch.full((n, J), 10.0),
+        joint_effort_limits=torch.full((n, J), 50.0), joint_pos_target=q0.repeat(n, 1).clone(),
+        joint_vel_target=torch.zeros(n, J), joint_effort_target=torch.zeros(n, J),
+        default_joint_pos=q0.repeat(n, 1).clone(),
+        body_pos_w=(body_pos if body_pos is not None else torch.zeros(n, len(bodies), 3)),
+        body_quat_w=torch.tensor([[[1.0, 0.0, 0.0, 0.0]] * len(bodies)] * n),
+        body_lin_vel_w=torch.zeros(n, len(bodies), 3), body_ang_vel_w=torch.zeros(n, len(bodies), 3))
+    return SimpleNamespace(data=d, joint_names=list(joints), body_names=list(bodies))
+
+
+class _Bot:
+    def __init__(self, art, **attrs):
+        self.articulation, self.name = art, "bot"
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+    def apply_action(self, action, substep=0):
+        self.articulation.data.joint_pos_target[:] = action
+
+    def post_step(self, env_ids=None):
+        pass
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class SharedReviewFixTests(unittest.TestCase):
+    def test_grippers_and_closing_direction_come_from_the_robot(self):
+        from robobench.core.prevention import _guards
+
+        # xArm vendor gripper: one drive joint, 0 = open, 0.85 = closed; passive "finger" mimic joints
+        xarm = fake_art(1, ["j1", "drive_joint", "left_finger_joint"], [-3, 0.0, 0.0], [3, 0.85, 0.85],
+                        [0.0, 0.0, 0.0], ["link0", "xarm_gripper_base_link"])
+        env = SimpleNamespace(robot=_Bot(xarm, GRIPPER_JOINTS=("drive_joint",), EE_BODY="xarm_gripper_base_link"),
+                              num_envs=1)
+        g = _guards(env)[0]
+        self.assertEqual(g.grip.tolist(), [False, True, False])  # the driven joint, not the mimic "finger"
+        self.assertEqual(float(g.close_sign[1]), 1.0)  # closes toward +0.85
+        self.assertEqual(g.ee_idxs, [1])
+        # Piper: mirrored fingers, joint7 0..0.05 open at 0.04, joint8 -0.05..0 open at -0.04
+        piper = fake_art(1, ["joint7", "joint8"], [0.0, -0.05], [0.05, 0.0], [0.04, -0.04], ["link6"])
+        g = _guards(SimpleNamespace(robot=_Bot(piper, GRIPPER_JOINTS=("joint7", "joint8")), num_envs=1))[0]
+        self.assertEqual(g.close_sign.tolist(), [-1.0, 1.0])  # each closes toward 0
+
+    def test_a_humanoid_has_two_hands_and_its_legs_are_not_slowed(self):
+        from robobench.core.prevention import SpeedGovernor, hand_bodies
+
+        n = 1
+        g1 = fake_art(n, ["left_hip_pitch_joint", "left_knee_joint", "left_shoulder_pitch_joint"],
+                      [-2, 0, -2], [2, 2, 2], [0.0, 0.5, 0.0], ["pelvis", "left_wrist_yaw_link", "right_wrist_yaw_link"])
+        env = SimpleNamespace(robot=_Bot(g1, EE_BODIES=("left_wrist_yaw_link", "right_wrist_yaw_link"),
+                                         LEG_JOINTS=(".*_hip_.*_joint", ".*_knee_joint")), num_envs=n, dt=0.01)
+        self.assertEqual([i for _, i in hand_bodies(env)], [1, 2])  # both hands
+        SpeedGovernor(env, ee_speed_max=0.1)
+        d = g1.data
+        d.body_lin_vel_w[:, 2] = torch.tensor([1.0, 0.0, 0.0])  # the RIGHT hand is fast
+        action = d.joint_pos.clone() + 0.1
+        env.robot.apply_action(action, 0)
+        env.robot.post_step()
+        lead = d.joint_pos_target - d.joint_pos
+        self.assertAlmostEqual(float(lead[0, 0]), 0.1, places=5)  # hip: not slowed (a leg)
+        self.assertAlmostEqual(float(lead[0, 1]), 0.1, places=5)  # knee: not slowed
+        self.assertLess(float(lead[0, 2]), 0.05)  # the arm joint is slowed (the right hand counts)
+
+    def test_hold_monitor_turning_with_the_hand_is_not_slip(self):
+        from robobench.core.prevention import HoldMonitor
+
+        egg = rigid(2, pos=(0.4, 0.0, 0.2))  # 10 cm below the hand (0.4, 0, 0.3)
+        env = prev_env(2, rigid_objects={"egg": egg})
+        d = env.robot.articulation.data
+        d.body_quat_w = torch.tensor([[[1.0, 0.0, 0.0, 0.0]] * 2] * 2)
+        mon = HoldMonitor(env, "egg", slip_tol=0.005)
+        mon.lock()
+        s = math.sqrt(0.5)  # the hand turns 90 deg about x, carrying the egg rigidly with it
+        d.body_quat_w[:, 1] = torch.tensor([s, s, 0.0, 0.0])
+        egg.data.root_pos_w[:] = torch.tensor([0.4, 0.1, 0.3])  # the offset rotated with the hand
+        substep(env)
+        self.assertEqual(mon.slipping.tolist(), [False, False])
+        egg.data.root_pos_w[:, 1] += 0.01  # now it really slides 1 cm in the hand
+        substep(env)
+        self.assertEqual(mon.slipping.tolist(), [True, True])
+
+    def test_the_release_gate_keeps_the_squeeze(self):
+        from robobench.suites.assembly.prevention.bulb import BulbPrevention
+
+        env, bulb = bulb_env()
+        prev = BulbPrevention(env)
+        d = env.robot.articulation.data
+        squeeze = d.joint_pos.clone()
+        squeeze[:, 7:9] = 0.0  # commanded shut on the bulb (fingers stalled at 0.02)
+        substep(env, squeeze)
+        squeezing_target = d.joint_pos_target[:, 7:9].clone()
+        self.assertTrue(bool((squeezing_target < d.joint_pos[:, 7:9]).all()))  # pressing inward
+        self.assertTrue(prev.lift_test("bulb_0", lift_with(env, bulb), steps=10))
+        put_bulb(bulb, 0.20)  # carried in the air
+        opening = d.joint_pos.clone()
+        opening[:, 7:9] = 0.04
+        substep(env, opening)  # told to open mid-air
+        held = d.joint_pos_target[:, 7:9]
+        self.assertTrue(bool((held < d.joint_pos[:, 7:9]).all()))  # still pressing, not merely "in place"
+
+    def test_the_grip_cap_does_not_slow_opening(self):
+        from robobench.core.prevention import GripGovernor
+
+        env = prev_env()
+        GripGovernor(env, force=1.0)  # 0.5 mm of squeeze at stiffness 2000
+        d = env.robot.articulation.data
+        action = d.joint_pos.clone()
+        action[:, 7:9] = 0.04  # open fully from 0.02
+        substep(env, action)
+        self.assertTrue(torch.allclose(d.joint_pos_target[:, 7:9], torch.full((2, 2), 0.04)))
+
+    def test_jam_trigger_stays_below_an_enforce_torque_clamp(self):
+        from robobench.core.prevention import effort_trigger
+        from robobench.core.safety import install_safety
+
+        env = prev_env()
+        install_safety(env, scene="bulb", mode="enforce")
+        self.assertAlmostEqual(effort_trigger(env, 0.5), 0.45)  # bulb's rule clamps at 0.5
+        env2 = prev_env()
+        install_safety(env2, scene="bulb", mode="monitor")
+        self.assertAlmostEqual(effort_trigger(env2, 0.5), 0.5)  # monitor mode clamps nothing
+
+    def test_a_monitor_added_before_the_shield_can_still_be_stopped(self):
+        from robobench.core.prevention import add_post_step, remove_post_step
+        from robobench.core.safety import install_safety
+
+        env = prev_env()
+        calls = []
+        fn = lambda: calls.append(1)  # noqa: E731
+        add_post_step(env, fn)  # before the shield: lives on the robot's chain
+        install_safety(env)
+        remove_post_step(env, fn)
+        substep(env)
+        self.assertEqual(calls, [])

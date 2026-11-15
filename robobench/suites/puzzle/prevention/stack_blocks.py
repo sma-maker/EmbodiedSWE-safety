@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING
 from robobench.core.prevention import (CarryPrevention, add_post_step, parallel_grippers, quat_rotate,
                                        required_grip_force, _guards, _obj)
 
+from robobench.core.prevention import hand_bodies
+
 if TYPE_CHECKING:
     import torch
 
@@ -44,7 +46,7 @@ __all__ = ["StackPrevention"]
 class StackPrevention(CarryPrevention):
     def __init__(self, env: BaseEnv, place_tol: float = 0.01, yaw_tol: float = 15.0, rest_tol: float = 0.005,
                  place_speed: float = 0.03, slow_above: float = 0.06, drop_speed: float = 1.0,
-                 hand_reach: float = 0.08, carry_speed: float = 0.3, carry_height: float = 0.15,
+                 hand_reach: float = 0.15, carry_speed: float = 0.3, carry_height: float = 0.15,
                  grip_force_max: float = 20.0, gate_fingers: bool | None = None, **kw) -> None:
         c = env.scene.cfg
         self.blocks = list(c.names)
@@ -52,10 +54,10 @@ class StackPrevention(CarryPrevention):
                          carry_height=carry_height, gate_fingers=parallel_grippers(env) if gate_fingers is None else gate_fingers, **kw)
         self.place_tol, self.yaw_tol, self.rest_tol = place_tol, yaw_tol, rest_tol
         self.place_speed, self.slow_above, self.drop_speed, self.hand_reach = place_speed, slow_above, drop_speed, hand_reach
-        self._hands = [(g.art, g.ee_idx) for g in _guards(env) if g.ee_idx is not None]
+        self._hands = hand_bodies(env)
         self.incidents: list[dict] = []
         self._latched: dict = {}
-        self._height_prev = self.tower_height().clone()
+        self._height_prev = self.tower_height(settled_only=True).clone()
         self._step = 0
         self.speed.add_limit(self._place_limit)
         add_post_step(env, self._watch)
@@ -100,8 +102,21 @@ class StackPrevention(CarryPrevention):
         at = ((p[:, 2] - z0 - lvl * c.block_size).abs() < c.z_tol) & ((p[:, :2] - pad).norm(dim=-1) < c.align_tol)
         return lvl.long(), at & self.level(b) & (lvl >= 0)
 
-    def tower_height(self, exclude: str | None = None) -> torch.Tensor:
-        """(n,) blocks in the contiguous tower from the pad up (no settle requirement)."""
+    def _free_still(self, b: str):
+        """(n,) bool: out of every hand and not moving — a block that is really part of the tower."""
+        import torch
+
+        p = _obj(self.env, b).data
+        ok = (p.root_lin_vel_w.norm(dim=-1) < 0.05).cpu()
+        for art, idx in self._hands:
+            ok &= ((art.data.body_pos_w[:, idx] - p.root_pos_w).norm(dim=-1) > self.hand_reach).cpu()
+        if not self._hands:
+            ok &= ~torch.tensor([o == b for o in self._held_obj])
+        return ok
+
+    def tower_height(self, exclude: str | None = None, settled_only: bool = False) -> torch.Tensor:
+        """(n,) blocks in the contiguous tower from the pad up. `settled_only`: count only blocks out
+        of the hand and still (the watchdog's view)."""
         import torch
 
         n = self.env.num_envs
@@ -111,6 +126,8 @@ class StackPrevention(CarryPrevention):
             if b == exclude:
                 continue
             lvl, at = self.slot(b)
+            if settled_only:
+                at = at.cpu() & self._free_still(b)
             for e in range(n):
                 if bool(at[e]) and 0 <= int(lvl[e]) < c.n_blocks:
                     filled[e, int(lvl[e])] = True
@@ -217,7 +234,7 @@ class StackPrevention(CarryPrevention):
         import torch
 
         self._step += 1
-        h = self.tower_height()
+        h = self.tower_height(settled_only=True)
         self._report("tower_fell", "tower", h < self._height_prev,
                      lambda e: {"from": int(self._height_prev[e]), "to": int(h[e])})
         self._height_prev = h.clone()

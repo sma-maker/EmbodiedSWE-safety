@@ -54,6 +54,8 @@ from typing import TYPE_CHECKING
 from robobench.core.prevention import (AddedEffort, CarryPrevention, add_post_step, parallel_grippers,
                                        quat_rotate_inverse, required_grip_force, _guards, _obj)
 
+from robobench.core.prevention import hand_bodies
+
 if TYPE_CHECKING:
     import torch
 
@@ -71,9 +73,9 @@ class ClearOrganicPrevention(CarryPrevention):
     DROP_KIND, THROW_KIND = "produce_dropped", "produce_thrown"  # incident names (subclasses rename)
 
     def __init__(self, env: BaseEnv, place_speed: float = 0.05, slow_above: float = 0.10,
-                 drop_speed: float = 1.0, throw_speed: float = 0.6, hand_reach: float = 0.08,
+                 drop_speed: float = 1.0, throw_speed: float = 0.6, hand_reach: float = 0.15,
                  rest_still: float = 0.03, carry_speed: float = 0.3, carry_height: float = 0.15,
-                 grip_force_max: float = 30.0, pad_friction: float = PAD_FRICTION, close_sign: float = -1.0,
+                 grip_force_max: float = 30.0, pad_friction: float = PAD_FRICTION, close_sign: float | None = None,
                  open_margin: float = 0.003, grip_arms=None, gate_fingers: bool | None = None) -> None:
         import torch
 
@@ -90,7 +92,7 @@ class ClearOrganicPrevention(CarryPrevention):
         n, dev = env.num_envs, self.gate_closed.device
         self.rested = {k: torch.zeros(n, dtype=torch.bool, device=dev) for k in self.names}
         self.effort = AddedEffort(env, 0.1)
-        self._hands = [(g.art, g.ee_idx) for g in _guards(env) if g.ee_idx is not None]
+        self._hands = hand_bodies(env)
         self.incidents: list[dict] = []
         self._latched: dict = {}
         self._step = 0
@@ -205,13 +207,14 @@ class ClearOrganicPrevention(CarryPrevention):
         import torch
 
         dev = self.gate_closed.device
+        carried = torch.tensor([o == item for o in self._held_obj], dtype=torch.bool, device=dev)
         if not self._hands:
-            return torch.tensor([o == item for o in self._held_obj], dtype=torch.bool, device=dev)
+            return carried
         p = _obj(self.env, item).data.root_pos_w
-        out = torch.zeros(p.shape[0], dtype=torch.bool, device=dev)
-        for art, idx in self._hands:
-            out |= ((art.data.body_pos_w[:, idx] - p).norm(dim=-1) <= self.hand_reach).to(dev)
-        return out
+        d = torch.stack([(art.data.body_pos_w[:, idx] - p).norm(dim=-1) for art, idx in self._hands], 1).amin(1).to(dev)
+        # near a hand, or registered as carried and still within reach (a part that slipped out
+        # mid-carry is far from every hand, registered or not)
+        return (d <= self.hand_reach) | (carried & (d <= 2 * self.hand_reach))
 
     def _report(self, kind: str, item: str, mask, info) -> None:
         import torch

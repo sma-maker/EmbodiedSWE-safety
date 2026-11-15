@@ -104,7 +104,7 @@ class PcMotherboardPrevention(CarryPrevention):
                  bolt_xy: float = 0.001, bolt_deg: float = 3.0, key_xy: float = 0.0015, key_deg: float = 5.0,
                  board_clear: float = 0.002, hole_clear: float = 0.008, board_margin: float = 0.02,
                  spin_rate: float = 0.5,
-                 push_ratio: float = 0.25, close_sign: float = -1.0, open_margin: float = 0.003,
+                 push_ratio: float = 0.25, close_sign: float | None = None, open_margin: float = 0.003,
                  grip_arms=None) -> None:
         import torch
 
@@ -338,7 +338,7 @@ class PcMotherboardPrevention(CarryPrevention):
     def key_near_board(self) -> torch.Tensor:
         """(n,) bool: the key tip is low over the board (within 5 cm of the face) — at work."""
         tip = self.key_tip()
-        return tip[:, 2] - self.scene.cfg.board_top < 0.05
+        return (tip[:, 2] - self.scene.cfg.board_top < 0.05) & self.over_board(tip[:, :2])
 
     def key_spin(self) -> torch.Tensor:
         """(n,) the key's turning rate about the hole axis (rad/s)."""
@@ -423,7 +423,13 @@ class PcMotherboardPrevention(CarryPrevention):
         d = _obj(self.env, obj).data
         slow = d.root_lin_vel_w.norm(dim=-1) < still
         if obj == "key":
-            return self._as_started(d, c.key_init_z, c.key_init_quat, tol) & slow
+            # as it started AND where it started (a 210 mm key upright anywhere else falls over)
+            o = getattr(self.env.iscene, "env_origins", None)
+            wx, wy = getattr(c, "workbench_pos", (0.0, 0.0))
+            home = d.root_pos_w.new_tensor((wx + c.key_init_xy[0], wy + c.key_init_xy[1]))
+            xy = d.root_pos_w[:, :2] - (0.0 if o is None else o[:, :2])
+            at_home = (xy - home).norm(dim=-1) < 0.05
+            return self._as_started(d, c.key_init_z, c.key_init_quat, tol) & at_home & slow
         i = int(obj.split("_")[1])
         _, dist = self.bolt_hole(i)
         threaded = (self.bolt_depth(i) >= 0.002) & (dist <= c.align_xy) & (self.bolt_tilt(i) <= c.align_axis_deg)

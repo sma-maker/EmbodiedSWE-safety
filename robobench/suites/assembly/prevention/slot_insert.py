@@ -84,7 +84,7 @@ class SlotInsertPrevention(CarryPrevention):
                  pad_friction: float = PAD_FRICTION, carry_speed: float = 0.25, carry_height: float = 0.15,
                  approach_speed: float = 0.03, entry_above: float = 0.005, entry_below: float = 0.0015,
                  push_ratio: float = 0.25, case_zone: float = 0.06, zone_above: float = 0.02,
-                 close_sign: float = -1.0, open_margin: float = 0.003, grip_arms=None) -> None:
+                 close_sign: float | None = None, open_margin: float = 0.003, grip_arms=None) -> None:
         import torch
 
         self.parts = {p.name: p for p in parts}
@@ -104,6 +104,9 @@ class SlotInsertPrevention(CarryPrevention):
         self.aligned_ok = {k: torch.zeros(n, dtype=torch.bool, device=dev) for k in self.parts}
         self.incidents: list[dict] = []  # watchdog records: {"env", "part", "step", "offset_mm", ...}
         self._shoving = {k: torch.zeros(n, dtype=torch.bool, device=dev) for k in self.parts}
+        #: envs whose PressMonitor just stopped for "shoving": the watchdog lets the push ease off
+        #: before it counts the same push as a shove attempt
+        self._excused = {k: torch.zeros(n, dtype=torch.bool, device=dev) for k in self.parts}
         self._arms = _guards(env)
         self._tau_base = [self._abs_tau(g) for g in self._arms]
         self._step = 0
@@ -302,7 +305,8 @@ class SlotInsertPrevention(CarryPrevention):
         shield = getattr(self.env, "safety", None)
         for k in self.parts:
             allowed = self.cleared(k) & self.in_slot_tolerance(k).to(dev)
-            shove = working[k] & hard & ~allowed
+            self._excused[k] &= hard  # excused only until the push eases
+            shove = working[k] & hard & ~allowed & ~self._excused[k]
             new = shove & ~self._shoving[k]
             self._shoving[k] = shove
             if not bool(new.any()):
@@ -344,7 +348,10 @@ class SlotInsertPrevention(CarryPrevention):
         down = d.root_pos_w[:, 2] - self._surface_z() < p.init_z + tol
         q0 = d.root_quat_w.new_tensor(p.init_quat).expand_as(d.root_quat_w)
         as_started = (d.root_quat_w * q0).sum(-1).abs() >= math.cos(math.radians(10.0) / 2)
-        return ((down & as_started) | self.seated(obj).to(slow.device)) & slow
+        # "as it started" only away from the case: upright at that height on the board or in a
+        # slot mouth is NOT put down (the case's board face is about as high as the holders' floor)
+        away = ~self.at_case(obj).to(slow.device)
+        return ((down & as_started & away) | self.seated(obj).to(slow.device)) & slow
 
     def grip_report(self) -> dict:
         return {"set_N": round(self.grip.force, 2), "max_N": self.grip.force_max,
@@ -411,6 +418,8 @@ class PressMonitor:
                 out.append("pressing")
             if out[-1] in self.PROBLEMS and self._stopped[e] is None:
                 self._stopped[e] = out[-1]
+                if out[-1] == "shoving":
+                    p._excused[k][e] = True  # this stop is the right response, not a new shove
                 p.clear(k, [e])
         return out
 

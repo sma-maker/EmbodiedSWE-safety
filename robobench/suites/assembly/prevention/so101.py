@@ -89,7 +89,7 @@ class SO101Prevention(CarryPrevention):
     def __init__(self, env: BaseEnv, grip_force_max: float = 40.0, pad_friction: float = PAD_FRICTION,
                  safety_factor: float = 2.0, carry_accel: float = 2.0, carry_speed: float = 0.25,
                  carry_height: float = 0.10, slip_deg: float = 5.0, rest_tol: float = 0.02,
-                 still: float = 0.02, still_ang: float = 0.2, close_sign: float = -1.0,
+                 still: float = 0.02, still_ang: float = 0.2, close_sign: float | None = None,
                  open_margin: float = 0.003, grip_arms=None) -> None:
         self.hold_slip_deg = slip_deg
         self.pad_friction, self.safety_factor, self.carry_accel = pad_friction, safety_factor, carry_accel

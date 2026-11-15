@@ -39,7 +39,7 @@ __all__ = ["SlicePrevention"]
 
 
 class SlicePrevention(KnifePrevention):
-    def __init__(self, env, food_radius: float = 0.03, **kw) -> None:
+    def __init__(self, env, food_radius: float = 0.02, **kw) -> None:
         super().__init__(env, **kw)
         self.food_radius = food_radius
         add_post_step(env, self._slice_watch)

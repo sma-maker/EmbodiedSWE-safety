@@ -94,7 +94,7 @@ class KnotPrevention:
             laces = torch.cat([torch.as_tensor(self.scene.lace_points(i, world=e), dtype=torch.float32)
                                for i in range(2)], dim=0)
             for art, idx in self._fingers:
-                f = t(art.data.body_pos_w)[e, idx]
+                f = t(art.data.body_pos_w)[e, idx].cpu()  # the laces are numpy (CPU)
                 out[e] += int((torch.cdist(f, laces) < self.wrap_dist).any(dim=0).sum())
         return out
 

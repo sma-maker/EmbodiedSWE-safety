@@ -72,7 +72,7 @@ class CoffeePrevention(CarryPrevention):
     def __init__(self, env: BaseEnv, cup_center_tol: float = 0.015, cup_tilt_deg: float = 5.0,
                  stream_radius: float = 0.06, spill_tilt_deg: float = 20.0, full_cup_speed: float = 0.15,
                  carry_speed: float = 0.3, carry_height: float = 0.15, grip_force_max: float = 30.0,
-                 pad_friction: float = PAD_FRICTION, close_sign: float = -1.0, open_margin: float = 0.003,
+                 pad_friction: float = PAD_FRICTION, close_sign: float | None = None, open_margin: float = 0.003,
                  grip_arms=None) -> None:
         import torch
 
@@ -120,8 +120,16 @@ class CoffeePrevention(CarryPrevention):
         up = quat_rotate(q, q.new_tensor((0.0, 0.0, 1.0)).expand(q.shape[0], 3))
         return torch.rad2deg(torch.arccos(up[:, 2].clamp(-1.0, 1.0)))
 
+    def cup_target_xy(self) -> torch.Tensor:
+        """(n, 2) where the mug's centre should stand: the scene's staged point, `cup_stage_y_off`
+        south of the spout axis (the nook's back wall keeps a mug's centre >= 3.3 cm off the axis,
+        and the stream lands in the mug's back third from there)."""
+        xy = self.spout_xy().clone()
+        xy[:, 1] += float(getattr(self.scene.cfg, "cup_stage_y_off", 0.0))
+        return xy
+
     def cup_offset(self) -> torch.Tensor:
-        return (_obj(self.env, "cup").data.root_pos_w[:, :2] - self.spout_xy()).norm(dim=-1)
+        return (_obj(self.env, "cup").data.root_pos_w[:, :2] - self.cup_target_xy()).norm(dim=-1)
 
     def robot_in_stream(self) -> torch.Tensor:
         """(n,) bool: any robot body inside the column under the spout (platform top to spout)."""
@@ -163,7 +171,7 @@ class CoffeePrevention(CarryPrevention):
             if not bool(pod[e]):
                 p.append("no pod seated in the bay")
             if not bool(centred[e]):
-                p.append(f"mug {float(off[e]) * 100:.1f} cm off the spout axis (max {self.cup_center_tol * 100:.1f})")
+                p.append(f"mug {float(off[e]) * 100:.1f} cm off its spot under the spout (max {self.cup_center_tol * 100:.1f})")
             if not bool(upright[e]):
                 p.append(f"mug tilted {float(tilt[e]):.1f} deg (max {self.cup_tilt_deg:.0f})")
             if not bool(clear[e]):
@@ -249,4 +257,9 @@ class CoffeePrevention(CarryPrevention):
             return placed & upright & slow
         bottom = d.root_pos_w[:, 2] - self._surface_z()
         low = (bottom < c.tray_h + c.pod_h).to(slow.device)
-        return (self._flag("pod_seated") | low) & slow
+        # over the pocket mouth, a short drop in: the scene is built around dropping the pod
+        o = self._origins()
+        pk = o[:, :2] + o.new_tensor((c.cm_pos[0] + c.pocket_off[0], c.cm_pos[1] + c.pocket_off[1]))
+        over = ((d.root_pos_w[:, :2] - pk).abs().amax(dim=-1) < c.pod_xy_tol).to(slow.device)
+        just_above = ((bottom > c.pocket_floor_z) & (bottom < c.pocket_wall_top_z + 0.04)).to(slow.device)
+        return (self._flag("pod_seated") | low | (over & just_above)) & slow

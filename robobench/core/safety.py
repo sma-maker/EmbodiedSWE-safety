@@ -171,8 +171,10 @@ class _ArmGuard:
         grip, vel, eff = [], [], []
         self.unrated: list[str] = []
         self.raised: list[dict] = []  # sim limits set ABOVE the hardware rating
+        meta = _ROBOT_META.get(id(art), {})
+        grip_pats = meta.get("grip") or (limits.gripper_joints,)
         for j, jn in enumerate(self.joint_names):
-            grip.append(re.fullmatch(limits.gripper_joints, jn) is not None)
+            grip.append(any(re.fullmatch(p, jn) is not None for p in grip_pats))
             r = rated.get(jn)
             if r is None:
                 self.unrated.append(jn)
@@ -186,6 +188,9 @@ class _ArmGuard:
             return torch.tensor(x, dtype=dtype, device=dev)
 
         self.grip = t(grip, torch.bool)
+        #: locomotion joints (a walking humanoid's legs): never slowed by arm-speed helpers
+        self.leg = t([any(re.fullmatch(p, jn) for p in meta.get("legs", ())) for jn in self.joint_names],
+                     torch.bool)
         self.rated_vel, self.rated_eff = t(vel), t(eff)
         self.vel_max = self.rated_vel * limits.vel_scale
         arm_scale = limits.effort_scale
@@ -209,13 +214,32 @@ class _ArmGuard:
         self.lo_trip, self.hi_trip = lo + m_trip, hi - m_trip
         self.check_pos = ~self.grip & torch.isfinite(lo) & torch.isfinite(hi)
 
-        self.ee_idx: int | None = None
+        #: every end-effector body of this articulation (a humanoid has two hands): the robot's
+        #: declared EE bodies, else every body matching the first `limits.ee_bodies` pattern that hits
+        self.ee_idxs: list[int] = []
         body_names = list(getattr(art, "body_names", []))
-        for pat in limits.ee_bodies:
-            hits = [i for i, b in enumerate(body_names) if re.fullmatch(pat, b)]
-            if hits:
-                self.ee_idx = hits[0]
+        for pats in ((meta.get("ee") or ()), limits.ee_bodies):
+            for pat in pats:
+                hits = [i for i, b in enumerate(body_names) if re.fullmatch(pat, b)]
+                if hits and pats is limits.ee_bodies:
+                    self.ee_idxs = hits
+                    break
+                self.ee_idxs += [h for h in hits if h not in self.ee_idxs]
+            if self.ee_idxs:
                 break
+        self.ee_idx: int | None = self.ee_idxs[0] if self.ee_idxs else None
+        #: per joint, the direction a gripper joint CLOSES (+1 / -1). Robots start with their grippers
+        #: open, so closing is toward the joint limit farther from the default position (Franka /
+        #: WXAI / Piper close toward 0 from either side; the xArm drive joint closes toward +0.85).
+        #: -1 where it cannot be told.
+        self.close_sign = torch.full_like(self.rated_vel, -1.0)
+        dflt = getattr(d, "default_joint_pos", None)
+        if dflt is not None:
+            q0 = dflt[0].to(lo.device)
+            far = torch.where((hi - q0).abs() > (lo - q0).abs(), hi, lo)
+            sgn = torch.sign(far - q0)
+            ok = self.grip & torch.isfinite(far) & (sgn != 0)
+            self.close_sign = torch.where(ok, sgn, self.close_sign)
         self.q_hold = d.joint_pos.detach().clone()
 
     # -- enforce --------------------------------------------------------------------------------
@@ -277,8 +301,8 @@ class _ArmGuard:
         q = d.joint_pos
         near = ((q < self.lo_trip) | (q > self.hi_trip)) & self.check_pos
         out["joint_limit"] = self._summarize(near.float(), near)
-        if self.ee_idx is not None and ee_speed_max is not None:
-            speed = d.body_lin_vel_w[:, self.ee_idx].norm(dim=-1)
+        if self.ee_idxs and ee_speed_max is not None:
+            speed = d.body_lin_vel_w[:, self.ee_idxs].norm(dim=-1).amax(dim=1)
             out["ee_speed"] = (speed > ee_speed_max * tol, speed, None)
         return out
 
@@ -288,8 +312,15 @@ class _ArmGuard:
         return viol.any(dim=1), peak, worst
 
 
+#: What each robot declares about its articulation (keyed by id(articulation)): its gripper joint
+#: patterns (`GRIPPER_JOINTS`) and end-effector bodies (`EE_BODIES` / `EE_BODY`). Read by
+#: `_ArmGuard` so grippers and hands come from the robot, not from guessing at joint names.
+_ROBOT_META: dict[int, dict[str, tuple[str, ...]]] = {}
+
+
 def _robot_articulations(robot: BaseRobot, prefix: str = "") -> list[tuple[str, str, Any]]:
-    """(name, robot class, articulation) for a robot, descending into composite robots."""
+    """(name, robot class, articulation) for a robot, descending into composite robots. Also
+    records the robot's declared gripper joints and end-effector bodies (`_ROBOT_META`)."""
     children = getattr(robot, "robots", None)
     if isinstance(children, dict) and children:
         out = []
@@ -299,6 +330,13 @@ def _robot_articulations(robot: BaseRobot, prefix: str = "") -> list[tuple[str, 
     art = getattr(robot, "articulation", None)
     if art is None:
         return []
+    ee = tuple(getattr(robot, "EE_BODIES", ()) or ())
+    if not ee and isinstance(getattr(robot, "EE_BODY", None), str):
+        ee = (robot.EE_BODY,)
+    grip = getattr(robot, "GRIPPER_JOINTS", ())
+    legs = getattr(robot, "LEG_JOINTS", ())
+    _ROBOT_META[id(art)] = {"grip": tuple(grip) if isinstance(grip, (tuple, list)) else (), "ee": ee,
+                            "legs": tuple(legs) if isinstance(legs, (tuple, list)) else ()}
     return [(f"{prefix}{getattr(robot, 'name', 'robot')}", type(robot).__name__, art)]
 
 

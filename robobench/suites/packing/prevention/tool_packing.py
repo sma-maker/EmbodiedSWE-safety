@@ -66,12 +66,12 @@ PAD_FRICTION = 0.5
 class ToolPackingPrevention(CarryPrevention):
     """Installs the tool_packing prevention (and its watchdog) on a live env."""
 
-    def __init__(self, env: BaseEnv, speed_max: float = 0.3, stop_speed: float = 0.05, slow_zone: float = 0.02,
-                 open_margin: float = 0.01, slam_speed: float = 0.10, door_speed_max: float = 0.5,
-                 door_stop_speed: float = 0.15, door_slow_deg: float = 10.0, push_ratio: float = 0.25,
+    def __init__(self, env: BaseEnv, speed_max: float = 0.25, stop_speed: float = 0.05, slow_zone: float = 0.02,
+                 open_margin: float = 0.01, slam_speed: float = 0.10, door_speed_max: float = 0.25,
+                 door_stop_speed: float = 0.10, door_slow_deg: float = 10.0, push_ratio: float = 0.25,
                  cabinet_slide: float = 0.01, cabinet_tilt_deg: float = 3.0, carry_speed: float = 0.3,
                  carry_height: float = 0.15, grip_force_max: float = 30.0, pad_friction: float = PAD_FRICTION,
-                 close_sign: float = -1.0, open_margin_fingers: float = 0.003, grip_arms=None) -> None:
+                 close_sign: float | None = None, open_margin_fingers: float = 0.003, grip_arms=None) -> None:
         import torch
 
         c = env.scene.cfg
@@ -80,7 +80,8 @@ class ToolPackingPrevention(CarryPrevention):
         super().__init__(env, min(self.needed.values()), grip_force_max, carry_speed=carry_speed,
                          carry_height=carry_height, close_sign=close_sign, open_margin=open_margin_fingers,
                          grip_arms=grip_arms)
-        self.speed_max, self.stop_speed, self.slow_zone, self.open_margin = speed_max, stop_speed, slow_zone, open_margin
+        # (the drawer margin has its own name: `open_margin` is the fingers' release margin)
+        self.speed_max, self.stop_speed, self.slow_zone, self.drawer_margin = speed_max, stop_speed, slow_zone, open_margin
         self.slam_speed, self.push_ratio = slam_speed, push_ratio
         self.door_speed_max, self.door_stop_speed = door_speed_max, door_stop_speed
         self.door_slow = math.radians(door_slow_deg)
@@ -120,8 +121,8 @@ class ToolPackingPrevention(CarryPrevention):
 
     def open_drawer(self, k, amount: float | None = None) -> FixtureMove:
         """Pull drawer `k` (index or name) out by `amount` (default: full travel less
-        `open_margin`, so it never hits its end stop)."""
-        amount = self.travel - self.open_margin if amount is None else min(amount, self.travel - self.open_margin)
+        `drawer_margin`, so it never hits its end stop)."""
+        amount = self.travel - self.drawer_margin if amount is None else min(amount, self.travel - self.drawer_margin)
         return self._start(self.drawer_j[self._drawer(k)], -amount, (-self.travel, 0.0), self.speed_max,
                            self.slow_zone, self.stop_speed, 0.005)
 
