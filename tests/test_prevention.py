@@ -3091,7 +3091,8 @@ class StackTshirtTests(unittest.TestCase):
 def latte_env(n=2):
     env = prev_env(n)
     env.iscene.env_origins = torch.zeros(n, 3)
-    milk = SimpleNamespace(data=SimpleNamespace(nodal_pos_w=torch.tensor([[[0.16, 0.0, 0.07]] * 50] * n)))
+    # off to the side (y = 0.25): clear of the fake arm's base-to-hand link, which runs along y = 0
+    milk = SimpleNamespace(data=SimpleNamespace(nodal_pos_w=torch.tensor([[[0.16, 0.25, 0.07]] * 50] * n)))
     state = {"spilled": torch.zeros(n)}
     env.scene = SimpleNamespace(
         cfg=SimpleNamespace(pitcher_h=0.0927, pitcher_r=0.030, coffee_cup_r=0.045, coffee_cup_h=0.0832),
@@ -3139,7 +3140,7 @@ class LatteDumplingTests(unittest.TestCase):
         shield = install_safety(env)
         prev = LattePrevention(env)
         tip_pitcher_over_mug(env)
-        env.robot.articulation.data.body_pos_w[1, 1] = torch.tensor([0.16, 0.0, 0.08])  # env 1: hand in the milk
+        env.robot.articulation.data.body_pos_w[1, 1] = torch.tensor([0.16, 0.25, 0.08])  # env 1: hand in the milk
         substep(env)
         kinds = sorted((i["env"], i["kind"]) for i in prev.incidents)
         self.assertEqual(kinds, [(0, "pour_unlocated"), (1, "milk_on_robot"), (1, "pour_unlocated")])
@@ -3210,7 +3211,9 @@ class KnotSliceTests(unittest.TestCase):
         laces = [torch.stack([hand, hand + 0.002, hand - 0.003, hand + 0.5]), torch.tensor([[1.0, 1.0, 0.0]])]
         env.scene = SimpleNamespace(lace_points=lambda i, world=0: laces[i].numpy())
         prev = KnotPrevention(env)
-        prev._fingers = [(env.robot.articulation, [1])]  # treat the hand body as the fingers
+        from robobench.core.prevention import LinkSegments
+
+        prev._fingers = LinkSegments(env, keep=lambda nm: nm == "panda_hand")  # the hand body as the fingers
         self.assertEqual(prev.lace_on_fingers().tolist(), [3, 3])
         self.assertFalse(bool(prev.release_ok().any()))
 
@@ -3727,3 +3730,146 @@ class SharedReviewFixTests(unittest.TestCase):
         remove_post_step(env, fn)
         substep(env)
         self.assertEqual(calls, [])
+
+
+# ----- the four follow-ups from the review --------------------------------------------------------
+class _Warp:
+    """A Newton/warp array stand-in: it is NOT a tensor; only its `.torch` view is."""
+
+    def __init__(self, t):
+        self.torch = t
+
+
+def warp_wrap(art):
+    """Turn every tensor field of `art.data` into a warp-like array (the Newton backend's layout)."""
+    for k, v in list(vars(art.data).items()):
+        if isinstance(v, torch.Tensor):
+            setattr(art.data, k, _Warp(v))
+    return art
+
+
+def two_arm_env(n=1, rigid_objects=None):
+    from test_safety import FakeMulti
+
+    arms = {}
+    for side, y in (("left", 0.3), ("right", -0.3)):
+        art = FakeArticulation(n)
+        art.data.body_pos_w = torch.zeros(n, 2, 3)
+        art.data.body_pos_w[:, 1] = torch.tensor([0.4, y, 0.3])  # each arm's panda_hand
+        arms[side] = FrankaRobot(art, side)
+    env = make_env(n, rigid=rigid_objects or {}, robot=FakeMulti(arms["left"], arms["right"]))
+    env.device = "cpu"
+    return env, arms
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class FollowUpFixTests(unittest.TestCase):
+    # 1. Newton warp data
+    def test_the_safety_layer_runs_on_newton_style_warp_data(self):
+        from robobench.core.safety import install_safety, tdata
+
+        art = warp_wrap(FakeArticulation(2))
+        raw = art.data.joint_pos_target.torch  # the sim buffer underneath
+        robot = FrankaRobot(art)
+        robot.apply_action = lambda a, substep=0: tdata(art).joint_pos_target.copy_(a)
+        env = make_env(2, robot=robot)
+        shield = install_safety(env, mode="enforce")
+        cmd = tdata(art).joint_pos.clone()
+        cmd[:, 0] = 99.0  # far past joint 1's limit
+        env.robot.apply_action(cmd, 0)
+        self.assertLess(float(raw[0, 0]), 2.9)  # clamped IN the sim buffer
+        art.data.joint_vel.torch[1, 0] = 50.0  # env 1: joint 1 far over its rated speed
+        env.robot.post_step()
+        self.assertIn("joint_speed", shield.reports()[1]["violation_substeps"])
+        self.assertNotIn("joint_speed", shield.reports()[0]["violation_substeps"])
+
+    def test_prevention_helpers_read_newton_style_warp_data(self):
+        from robobench.core.prevention import SpeedGovernor, hand_bodies
+        from robobench.core.safety import tdata
+
+        art = FakeArticulation(1)
+        art.data.body_pos_w = torch.zeros(1, 2, 3)
+        warp_wrap(art)
+        robot = FrankaRobot(art)
+        robot.apply_action = lambda a, substep=0: tdata(art).joint_pos_target.copy_(a)
+        env = make_env(1, robot=robot)
+        env.device = "cpu"
+        self.assertEqual([i for _, i in hand_bodies(env)], [1])
+        SpeedGovernor(env, ee_speed_max=0.1)
+        art.data.body_lin_vel_w.torch[:, 1] = torch.tensor([1.0, 0.0, 0.0])  # the hand is fast
+        q = art.data.joint_pos.torch
+        env.robot.apply_action(q + 0.1, 0)
+        env.robot.post_step()
+        self.assertLess(float((art.data.joint_pos_target.torch - q)[0, 0]), 0.05)  # slowed, in the buffer
+
+    # 2. whole links, not link origins
+    def test_link_segments_follow_the_urdf_tree_and_extend_tip_links(self):
+        from robobench.core.prevention import LinkSegments
+
+        env = prev_env(1)  # a Franka with only panda_link0 (origin) and panda_hand (0.4, 0, 0.3)
+        links = LinkSegments(env)
+        A, B = links.segments()
+        # panda_hand hangs off panda_link0 (link1..link8 are not simulated bodies here) and is a tip,
+        # so its segment runs base -> hand and on past the hand by its own length
+        self.assertTrue(torch.allclose(A[0, 1], torch.zeros(3)))
+        self.assertTrue(torch.allclose(B[0, 1], torch.tensor([0.8, 0.0, 0.6])))
+        mid = torch.tensor([[[0.2, 0.0, 0.15]]])  # halfway along the link: 25 cm from either origin
+        self.assertLess(float(links.distance(mid).min()), 1e-6)
+
+    def test_milk_along_a_link_counts_and_milk_in_the_pitcher_does_not(self):
+        from robobench.suites.deformable.prevention.latte import LattePrevention
+
+        env, _ = latte_env(n=2)
+        prev = LattePrevention(env)
+        # env 0: loose milk on the MIDDLE of the arm's base-to-hand link (20+ cm from both origins)
+        env.scene.milk.data.nodal_pos_w[0] = torch.tensor([0.2, 0.0, 0.15])
+        # env 1: the same spot, but the pitcher sits right there and the milk is inside it
+        env.scene.pitcher_pose_w[1] = torch.tensor([0.2, 0.0, 0.12, 0.0, 0.0, 0.0, 1.0])
+        env.scene.milk.data.nodal_pos_w[1] = torch.tensor([0.2, 0.0, 0.15])
+        self.assertEqual(prev.milk_on_robot().tolist(), [True, False])
+
+    def test_a_lace_on_the_middle_of_a_finger_counts(self):
+        from robobench.core.prevention import LinkSegments
+        from robobench.suites.deformable.prevention.shoe_knot import KnotPrevention
+
+        env = prev_env(1)
+        mid = torch.tensor([0.2, 0.0, 0.15])  # middle of the base-to-hand link, 25 cm from its origins
+        laces = [torch.stack([mid, mid + 0.005, mid + 0.5]), torch.tensor([[1.0, 1.0, 0.0]])]
+        env.scene = SimpleNamespace(lace_points=lambda i, world=0: laces[i].numpy())
+        prev = KnotPrevention(env)
+        prev._fingers = LinkSegments(env, keep=lambda nm: nm == "panda_hand")
+        self.assertEqual(prev.lace_on_fingers().tolist(), [2])
+
+    # 3. only the working arm "pushes hard"
+    def test_an_idle_second_arm_is_not_pushing_on_the_part(self):
+        from robobench.core.prevention import InsertionMonitor, arm_nearest
+
+        peg = rigid(1, pos=(0.4, 0.3, 0.2))  # under the LEFT hand
+        env, arms = two_arm_env(1, {"peg": peg})
+        mon = InsertionMonitor(env, "peg", axis=(0.0, 0.0, -1.0), seat_depth=0.01, effort_ratio=0.5)
+        self.assertEqual(arm_nearest(env, mon._arms, peg.data.root_pos_w).tolist(), [[True, False]])
+        arms["right"].articulation.data.applied_torque[:, 1] = 80.0  # right arm braced on the table
+        self.assertFalse(bool(mon._pushing_hard().any()))
+        arms["left"].articulation.data.applied_torque[:, 1] = 80.0  # the left arm pushes the peg
+        self.assertTrue(bool(mon._pushing_hard().all()))
+
+    def test_one_arm_always_counts(self):
+        from robobench.core.prevention import _guards, arm_nearest
+
+        env = prev_env(2)
+        self.assertEqual(arm_nearest(env, _guards(env), torch.zeros(2, 3)).tolist(), [[True], [True]])
+
+    # 4. organics per env
+    def test_organics_are_listed_per_env(self):
+        from robobench.suites.packing.prevention.clear_organic_objects import ClearOrganicPrevention
+
+        env, _ = organic_env(n=2)
+        env.scene.organics_present = lambda: torch.tensor([[True, False], [False, True]])  # lemon, lime
+        prev = ClearOrganicPrevention(env)
+        self.assertEqual(prev.organics(), ["lemon_0", "lime_0"])  # in any env
+        self.assertEqual(prev.organics(0), ["lemon_0"])
+        self.assertEqual(prev.organics(1), ["lime_0"])
+        self.assertEqual(prev.organic_present("lime_0").tolist(), [False, True])
+        self.assertEqual(prev.organic_present("milk_jug").tolist(), [False, False])  # not organic
+        env.scene.organics_present = None  # a scene that does not sample: every organic, every env
+        self.assertEqual(prev.organics(1), ["lemon_0", "lime_0"])

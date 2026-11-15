@@ -39,7 +39,8 @@ Usage in a solution:
 
     def solve(env):
         prev = ClearOrganicPrevention(env)
-        for item in prev.organics():
+        for item in prev.organics():               # present in any env
+            todo = prev.organic_present(item)      # (n,) the envs that have it
             ...                                    # grasp, prev.lift_test(item, ...)
             ...                                    # carry over the bin, lower (slowed) to the floor/pile
             while not prev.set_down_test(item, lambda: env.step(small_lower)):
@@ -99,14 +100,35 @@ class ClearOrganicPrevention(CarryPrevention):
         self.speed.add_limit(self._place_limit)
         add_post_step(env, self._watch)
 
-    def organics(self) -> list[str]:
-        """The organic items present in env 0's episode."""
-        pres = getattr(self.scene, "organics_present", None)
+    #: the scene method giving (n, n_organic) bool "sampled present this episode"
+    PRESENT_FN = "organics_present"
+
+    def _presence(self):
+        """(organic item names, (n, k) bool presence per env — all True if the scene has none)."""
+        import torch
+
         org = [k for k in self.names if self.is_organic[k]]
-        if pres is None:
-            return org
-        mask = pres()[0]
-        return [k for k, m in zip(org, mask.tolist()) if m] if len(mask) == len(org) else org
+        pres = getattr(self.scene, self.PRESENT_FN, None)
+        mask = None if pres is None else torch.as_tensor(pres()).bool().cpu()
+        if mask is None or mask.ndim != 2 or mask.shape[1] != len(org):
+            mask = torch.ones(self.env.num_envs, len(org), dtype=torch.bool)
+        return org, mask
+
+    def organics(self, env: int | None = None) -> list[str]:
+        """The organic items present this episode: in env `env`, or (default) in ANY env. Each env
+        samples its own set, so with several envs check `organic_present(item)` per env."""
+        org, mask = self._presence()
+        m = mask.any(dim=0) if env is None else mask[env]
+        return [k for k, keep in zip(org, m.tolist()) if keep]
+
+    def organic_present(self, item: str) -> torch.Tensor:
+        """(n,) bool: `item` is an organic present in that env's episode."""
+        import torch
+
+        org, mask = self._presence()
+        if item not in org:
+            return torch.zeros(self.env.num_envs, dtype=torch.bool)
+        return mask[:, org.index(item)]
 
     # -- bin geometry (bin body frame: origin at the base centre) -------------------------------
     def bin_local(self, item: str) -> torch.Tensor:

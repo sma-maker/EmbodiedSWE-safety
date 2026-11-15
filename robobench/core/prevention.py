@@ -54,7 +54,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
-from .safety import RobotLimits, _ArmGuard, _robot_articulations, request_approval
+from .safety import RobotLimits, _ArmGuard, _robot_articulations, link_tree_for, request_approval, tdata
 
 if TYPE_CHECKING:
     import torch
@@ -142,6 +142,108 @@ def _guards(env: BaseEnv) -> list[_ArmGuard]:
             for name, cls, art in _robot_articulations(env.robot)]
 
 
+def arm_nearest(env: BaseEnv, guards: Sequence[_ArmGuard], pos) -> torch.Tensor:
+    """(n, G) bool: per env, the arm (guard) whose nearest hand is closest to `pos` (n, 3). With one
+    arm, or an arm whose hand is unknown, every arm counts (all True). Used so "pushing hard" means
+    the arm doing the work, not an idle second arm (or one braced on the table)."""
+    import torch
+
+    n = env.num_envs
+    if len(guards) < 2 or any(not g.ee_idxs for g in guards):
+        return torch.ones(n, len(guards), dtype=torch.bool)
+    pos = torch.as_tensor(pos).detach().cpu().float()
+    d = torch.stack([(g.data.body_pos_w[:, g.ee_idxs].detach().cpu() - pos[:, None]).norm(dim=-1).amin(dim=1)
+                     for g in guards], dim=1)  # (n, G)
+    return torch.nn.functional.one_hot(d.argmin(dim=1), len(guards)).bool()
+
+
+
+class LinkSegments:
+    """Robot links as line segments, for "is X touching the robot" checks that a link's ORIGIN alone
+    gets wrong (a forearm's origin sits at its elbow, a finger's at its base). Each link runs from
+    its parent link's origin to its own, using the robot's URDF link tree; a tip link (no child, e.g.
+    a finger) is extended past its origin by `tip_extend` x its own length, since its body lies
+    beyond its frame. Links whose parent is not a simulated body hang off the nearest one that is.
+    Robots without a URDF fall back to each link's origin (zero-length segments).
+    `keep(link_name)` picks the links to include (default: all)."""
+
+    def __init__(self, env: BaseEnv, keep: Callable[[str], bool] | None = None, tip_extend: float = 1.0) -> None:
+        import torch
+
+        self.parts = []  # (articulation, start idx (S,), end idx (S,), tip (S,) bool)
+        for _, cls, art in _robot_articulations(env.robot):
+            names = list(getattr(art, "body_names", []))
+            at = {nm: i for i, nm in enumerate(names)}
+            parent = link_tree_for(cls)
+
+            def present_parent(link: str):
+                p = parent.get(link)
+                seen = set()
+                while p is not None and p not in at and p not in seen:
+                    seen.add(p)
+                    p = parent.get(p)
+                return p if p in at else None
+
+            pp = {nm: present_parent(nm) for nm in names}
+            has_child = {p for p in pp.values() if p is not None}
+            a, b, tip = [], [], []
+            for nm in names:
+                if keep is not None and not keep(nm):
+                    continue
+                p = pp[nm]
+                a.append(at[p] if p is not None else at[nm])
+                b.append(at[nm])
+                tip.append(p is not None and nm not in has_child)
+            if b:
+                self.parts.append((art, torch.tensor(a), torch.tensor(b), torch.tensor(tip)))
+        self.tip_extend = tip_extend
+
+    def __bool__(self) -> bool:
+        return bool(self.parts)
+
+    def segments(self):
+        """(start, end): (n, S, 3) each, world frame, on the CPU."""
+        import torch
+
+        starts, ends = [], []
+        for art, a, b, tip in self.parts:
+            pos = tdata(art).body_pos_w.detach().cpu().float()
+            A, B = pos[:, a], pos[:, b]
+            B = torch.where(tip[None, :, None], B + self.tip_extend * (B - A), B)
+            starts.append(A)
+            ends.append(B)
+        return torch.cat(starts, dim=1), torch.cat(ends, dim=1)
+
+    def points(self, k: int = 5) -> torch.Tensor:
+        """(n, S*k, 3): `k` evenly spaced points along every link (ends included), CPU."""
+        import torch
+
+        A, B = self.segments()
+        s = torch.linspace(0.0, 1.0, max(2, k))
+        return (A[:, :, None] + s[None, None, :, None] * (B - A)[:, :, None]).flatten(1, 2)
+
+    def distance(self, pts, env: int | None = None) -> torch.Tensor:
+        """(n, S, P): distance from each point (n, P, 3) to each link segment's centre line. With
+        `env`, `pts` is that env's (P, 3) and the result is (S, P)."""
+        import torch
+
+        A, B = self.segments()
+        P = torch.as_tensor(pts).detach().cpu().float()
+        if env is not None:
+            A, B = A[env:env + 1], B[env:env + 1]
+            return self.distance_between(A, B, P[None])[0]
+        return self.distance_between(A, B, P)
+
+    @staticmethod
+    def distance_between(A, B, P) -> torch.Tensor:
+        """(n, S, P): point (n, P, 3) to segment (A, B: (n, S, 3)) distances."""
+        ab = B - A  # (n, S, 3)
+        ap = P[:, None] - A[:, :, None]  # (n, S, P, 3)
+        L2 = (ab * ab).sum(-1, keepdim=True).clamp(min=1e-12)  # (n, S, 1)
+        s = ((ap * ab[:, :, None]).sum(-1) / L2).clamp(0.0, 1.0)  # (n, S, P)
+        return (ap - s[..., None] * ab[:, :, None]).norm(dim=-1)
+
+
 def hand_bodies(env: BaseEnv) -> list[tuple[Any, int]]:
     """(articulation, body index) for EVERY hand of every robot arm — a humanoid has two."""
     return [(g.art, i) for g in _guards(env) for i in g.ee_idxs]
@@ -225,7 +327,7 @@ class GripGovernor:
                 continue
             if arms is not None and not any(a in g.name for a in arms):
                 continue
-            k = getattr(g.art.data, "joint_stiffness", None)
+            k = getattr(g.data, "joint_stiffness", None)
             k = k[0].clone() if k is not None else torch.full_like(g.rated_vel, default_stiffness)
             k = torch.where(k > 0, k, torch.full_like(k, default_stiffness))
             self._arms.append((g.art, g.grip, k, _RawCommand(), _RawCommand(), g.close_sign))
@@ -236,14 +338,14 @@ class GripGovernor:
 
     def _snapshot(self) -> None:
         for art, _, _, raw_pos, raw_eff, _ in self._arms:
-            raw_pos.snapshot(art.data.joint_pos_target)
-            raw_eff.snapshot(art.data.joint_effort_target)
+            raw_pos.snapshot(tdata(art).joint_pos_target)
+            raw_eff.snapshot(tdata(art).joint_effort_target)
 
     def _filter(self) -> None:
         import torch
 
         for art, grip, k, raw_pos, raw_eff, sign in self._arms:
-            d = art.data
+            d = tdata(art)
             target, effort = raw_pos.raw(d.joint_pos_target), raw_eff.raw(d.joint_effort_target)
             gap = self.force / k
             q = d.joint_pos
@@ -277,8 +379,8 @@ class SpeedGovernor:
 
     def _snapshot(self) -> None:
         for g, (raw_pos, raw_eff) in zip(self._arms, self._raw):
-            raw_pos.snapshot(g.art.data.joint_pos_target)
-            raw_eff.snapshot(g.art.data.joint_effort_target)
+            raw_pos.snapshot(g.data.joint_pos_target)
+            raw_eff.snapshot(g.data.joint_effort_target)
 
     def add_limit(self, fn: Callable[[], Any]) -> None:
         """`fn()` -> per-env end-effector speed limit (n,), inf where it does not apply."""
@@ -298,7 +400,7 @@ class SpeedGovernor:
 
         lim = self.limit()
         for g, (raw_pos, raw_eff) in zip(self._arms, self._raw):
-            d = g.art.data
+            d = g.data
             target, effort = raw_pos.raw(d.joint_pos_target), raw_eff.raw(d.joint_effort_target)
             arm = ~g.grip & ~getattr(g, "leg", torch.zeros_like(g.grip))  # a walking robot's legs are not slowed
             scale = torch.ones_like(lim)
@@ -430,12 +532,13 @@ class InsertionMonitor:
 
         hard = torch.zeros_like(self.stalled)
         thr = effort_trigger(self.env, self.effort_ratio)
-        for g in self._arms:
-            tau = getattr(g.art.data, "applied_torque", None)
+        doing = arm_nearest(self.env, self._arms, self.obj.data.root_pos_w)  # only the inserting arm
+        for i, g in enumerate(self._arms):
+            tau = getattr(g.data, "applied_torque", None)
             if tau is None:
                 continue
             ratio = torch.where(g.grip, torch.zeros_like(tau), tau.abs() / g.rated_eff)
-            hard |= (ratio > thr).any(dim=1)
+            hard |= ((ratio > thr).any(dim=1) & doing[:, i].to(tau.device)).to(hard.device)
         return hard
 
     def _update(self) -> None:
@@ -500,12 +603,12 @@ class HoldMonitor:
     def _all_hand_pos(self):
         import torch
 
-        return torch.stack([art.data.body_pos_w[:, i] for art, i in self._hands], dim=1)  # (n, H, 3)
+        return torch.stack([tdata(art).body_pos_w[:, i] for art, i in self._hands], dim=1)  # (n, H, 3)
 
     def _all_hand_quat(self):
         import torch
 
-        qs = [getattr(art.data, "body_quat_w", None) for art, _ in self._hands]
+        qs = [getattr(tdata(art), "body_quat_w", None) for art, _ in self._hands]
         if any(q is None for q in qs):
             return None
         return torch.stack([q[:, i] for q, (_, i) in zip(qs, self._hands)], dim=1)  # (n, H, 4)
@@ -615,7 +718,7 @@ class TurnMonitor:
         if not self._hands:
             raise ValueError("no end-effector body found to measure the turn against")
         p = self.obj.data.root_pos_w
-        d = torch.stack([(art.data.body_pos_w[:, i] - p).norm(dim=-1) for art, i in self._hands], 1)
+        d = torch.stack([(tdata(art).body_pos_w[:, i] - p).norm(dim=-1) for art, i in self._hands], 1)
         self._hand = d.argmin(dim=1)
         self._need = max(1, round(slip_time / env.dt))
         self._count = torch.zeros(env.num_envs, dtype=torch.long, device=p.device)
@@ -627,7 +730,7 @@ class TurnMonitor:
         import torch
 
         axis = self.axis_fn()
-        w = torch.stack([art.data.body_ang_vel_w[:, i] for art, i in self._hands], 1)
+        w = torch.stack([tdata(art).body_ang_vel_w[:, i] for art, i in self._hands], 1)
         rows = torch.arange(w.shape[0], device=w.device)
         return (w[rows, self._hand.to(w.device)] * axis).sum(-1), (self.obj.data.root_ang_vel_w * axis).sum(-1)
 
@@ -662,7 +765,7 @@ class FixtureGuard:
         self.art, self.speed_max = arts[fixture], speed_max
 
     def speed(self) -> torch.Tensor:
-        return self.art.data.joint_vel.abs().max(dim=1).values
+        return tdata(self.art).joint_vel.abs().max(dim=1).values
 
     def scale(self) -> torch.Tensor:
         import torch
@@ -683,7 +786,7 @@ class AddedEffort:
 
     @staticmethod
     def _tau(g):
-        tau = getattr(g.art.data, "applied_torque", None)
+        tau = getattr(g.data, "applied_torque", None)
         return None if tau is None else tau.abs().clone()
 
     def rebase(self) -> None:
@@ -731,14 +834,14 @@ class FixtureMove:
             effort.rebase()
         self.min_progress = min_progress if min_progress is not None else 0.1 * slow_zone
         self._window = deque(maxlen=max(2, round(window_s / env.dt)))
-        self.straining = torch.zeros(env.num_envs, dtype=torch.bool, device=art.data.joint_pos.device)
+        self.straining = torch.zeros(env.num_envs, dtype=torch.bool, device=tdata(art).joint_pos.device)
         add_post_step(env, self._update)
 
     def pos(self) -> torch.Tensor:
-        return self.art.data.joint_pos[:, self.j]
+        return tdata(self.art).joint_pos[:, self.j]
 
     def vel(self) -> torch.Tensor:
-        return self.art.data.joint_vel[:, self.j]
+        return tdata(self.art).joint_vel[:, self.j]
 
     def allowed_speed(self) -> torch.Tensor:
         """(n,) speed allowed now: `stop_speed` near the stop the joint is heading for."""
@@ -823,7 +926,7 @@ class AimGuard:
         ray = ray / ray.norm(dim=-1, keepdim=True)
         safe = torch.ones(self.env.num_envs, dtype=torch.bool, device=origin.device)
         for art in self._arts:
-            v = art.data.body_pos_w - origin[:, None, :]  # (n, B, 3)
+            v = tdata(art).body_pos_w - origin[:, None, :]  # (n, B, 3)
             t = (v * ray[:, None, :]).sum(-1)
             miss = (v - t[..., None].clamp(0.0, self.reach) * ray[:, None, :]).norm(dim=-1)
             near_nozzle = v.norm(dim=-1) < self.ignore_radius
@@ -893,7 +996,7 @@ class FingerReleaseCheck:
             return
         stuck = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self._stuck_for.device)
         for g in self._arms:
-            d = g.art.data
+            d = g.data
             far = (d.joint_pos_target - d.joint_pos).abs() > self.gap_tol
             still = d.joint_vel.abs() < self.stall_speed
             stuck |= (far & still & g.grip).any(dim=1)
@@ -1198,13 +1301,13 @@ class CarryPrevention:
         self._held_obj: list[str | None] = [None] * env.num_envs
         self._grip_guards = [g for g in _guards(env) if bool(g.grip.any())]
         dev = self._grip_guards[0].q_hold.device
-        self._gate_q = [g.art.data.joint_pos.clone() for g in self._grip_guards]
-        self._q_grasp = [g.art.data.joint_pos.clone() for g in self._grip_guards]
+        self._gate_q = [g.data.joint_pos.clone() for g in self._grip_guards]
+        self._q_grasp = [g.data.joint_pos.clone() for g in self._grip_guards]
         #: per gripper: the direction each joint closes (the robot's own, unless `close_sign` is given)
         self._sign = [g.close_sign if close_sign is None else torch.full_like(g.close_sign, float(close_sign))
                       for g in self._grip_guards]
         #: per gripper: the last CLOSING command — what the gate holds, so the squeeze stays on
-        self._hold_tgt = [g.art.data.joint_pos_target.clone() for g in self._grip_guards]
+        self._hold_tgt = [g.data.joint_pos_target.clone() for g in self._grip_guards]
         self.gate_closed = torch.zeros(env.num_envs, dtype=torch.bool, device=dev)
         #: per env: index into the grippers of the hand holding the part (-1 = all hands)
         self._held_arm = torch.full((env.num_envs,), -1, dtype=torch.long, device=dev)
@@ -1224,7 +1327,7 @@ class CarryPrevention:
         pts = (bodies if bodies is not None and bodies.shape[1] > 1 else d.root_pos_w[:, None]).to(dev)
         per = []
         for g in self._grip_guards:  # per env: this gripper's nearest hand to the part's nearest link
-            hands = g.art.data.body_pos_w[:, g.ee_idxs].to(dev)  # (n, Hg, 3)
+            hands = g.data.body_pos_w[:, g.ee_idxs].to(dev)  # (n, Hg, 3)
             per.append((hands[:, :, None] - pts[:, None]).norm(dim=-1).flatten(1).amin(dim=1))
         return torch.stack(per, dim=1).argmin(dim=1)
 
@@ -1276,7 +1379,7 @@ class CarryPrevention:
             self._held_obj[e] = obj
         self._held_arm = self._nearest_gripper(obj)
         for g, q in zip(self._grip_guards, self._q_grasp):
-            q.copy_(g.art.data.joint_pos)  # the closure on the part: "opened" is measured from here
+            q.copy_(g.data.joint_pos)  # the closure on the part: "opened" is measured from here
 
     # -- release gate ---------------------------------------------------------------------------
     def release_allowed(self) -> torch.Tensor:
@@ -1312,7 +1415,7 @@ class CarryPrevention:
         newly = blocked & ~self.gate_closed
         opened = torch.zeros_like(blocked)
         for k, (g, q_gate, q_grasp) in enumerate(zip(self._grip_guards, self._gate_q, self._q_grasp)):
-            d = g.art.data
+            d = g.data
             sign = self._sign[k]
             holder = (self._held_arm == k) | (self._held_arm < 0)  # (n,) this hand holds the part
             q_gate[newly] = d.joint_pos[newly]

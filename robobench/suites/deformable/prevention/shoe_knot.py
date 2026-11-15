@@ -17,7 +17,7 @@ pulling apart. Every release is a moment a lace can be wrapped around a finger.
      reports it; `staff_clear()` asks staff to confirm the fingers are free
      (`fingers_free_verified`), which unfreezes the arm.
   3. Watch the laces near the hand: `lace_on_fingers()` counts lace points within `wrap_dist` of
-     a finger body; with the hand opening and laces still on the fingers, staff are asked to look
+     a finger's surface (whole finger links, base to tip); with the hand opening and laces still on the fingers, staff are asked to look
      before the arm moves away (`release_ok()` is False until they clear it).
   4. Watchdog: `fingers_entangled` (the release check caught the fingers — the signal named in
      safety_rules.py), recorded in `incidents` and reported to the safety layer.
@@ -27,9 +27,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from robobench.core.prevention import FingerReleaseCheck, SpeedGovernor, add_post_step
-from robobench.core.safety import _robot_articulations, request_approval
-from robobench.suites.deformable.prevention._common import Reporter, t
+from robobench.core.prevention import FingerReleaseCheck, LinkSegments, SpeedGovernor, add_post_step
+from robobench.core.safety import request_approval
+from robobench.suites.deformable.prevention._common import Reporter
 
 if TYPE_CHECKING:
     import torch
@@ -40,21 +40,18 @@ APPROVAL = "fingers_free_verified"
 
 
 class KnotPrevention:
-    def __init__(self, env, stuck_s: float = 0.2, wrap_dist: float = 0.01, wrap_points: int = 3) -> None:
+    def __init__(self, env, stuck_s: float = 0.2, wrap_dist: float = 0.01, wrap_points: int = 3,
+                 finger_radius: float = 0.008) -> None:
         import torch
 
         self.env, self.scene = env, env.scene
-        self.wrap_dist, self.wrap_points = wrap_dist, wrap_points
+        self.wrap_dist, self.wrap_points, self.finger_radius = wrap_dist, wrap_points, finger_radius
         self.release = FingerReleaseCheck(env, window_s=stuck_s)
         self.frozen = torch.zeros(env.num_envs, dtype=torch.bool)
         self.speed = SpeedGovernor(env)
         self.speed.add_limit(lambda: torch.where(self.frozen, torch.zeros(env.num_envs), torch.full((env.num_envs,), float("inf"))))
-        self._fingers = []  # (articulation, body indices) of finger links
-        for _, _, art in _robot_articulations(env.robot):
-            names = list(getattr(art, "body_names", []))
-            idx = [i for i, nm in enumerate(names) if "finger" in nm or "thumb" in nm or "index" in nm]
-            if idx:
-                self._fingers.append((art, idx))
+        # finger links as segments (base to tip, from the URDF tree), not just their origins
+        self._fingers = LinkSegments(env, keep=lambda nm: "finger" in nm or "thumb" in nm or "index" in nm)
         self.report = Reporter(env)
         add_post_step(env, self._watch)
 
@@ -83,19 +80,20 @@ class KnotPrevention:
 
     # -- 3. laces near the hand ------------------------------------------------------------------
     def lace_on_fingers(self):
-        """(n,) number of lace points within `wrap_dist` of any finger body."""
+        """(n,) number of lace points within `wrap_dist` of a finger's surface (its base-to-tip
+        centre line + `finger_radius`)."""
         import torch
 
         n = self.env.num_envs
         out = torch.zeros(n, dtype=torch.long)
         if not self._fingers:
             return out
+        reach = self.wrap_dist + self.finger_radius
         for e in range(n):
             laces = torch.cat([torch.as_tensor(self.scene.lace_points(i, world=e), dtype=torch.float32)
-                               for i in range(2)], dim=0)
-            for art, idx in self._fingers:
-                f = t(art.data.body_pos_w)[e, idx].cpu()  # the laces are numpy (CPU)
-                out[e] += int((torch.cdist(f, laces) < self.wrap_dist).any(dim=0).sum())
+                               for i in range(2)], dim=0)  # the laces are numpy (CPU)
+            d = self._fingers.distance(laces, env=e)  # (S, L)
+            out[e] = int((d < reach).any(dim=0).sum())
         return out
 
     def release_ok(self):

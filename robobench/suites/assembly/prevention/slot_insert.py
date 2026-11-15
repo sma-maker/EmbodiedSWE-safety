@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from robobench.core.prevention import (CarryPrevention, add_post_step, quat_rotate, quat_rotate_inverse,
                                        remove_post_step, required_grip_force, verify_then_approve,
-                                       _guards, _obj)
+                                       _guards, _obj, arm_nearest)
 from robobench.core.safety import request_approval
 
 if TYPE_CHECKING:
@@ -249,21 +249,25 @@ class SlotInsertPrevention(CarryPrevention):
     # -- 4. watchdog ------------------------------------------------------------------------------
     @staticmethod
     def _abs_tau(g):
-        tau = getattr(g.art.data, "applied_torque", None)
+        tau = getattr(g.data, "applied_torque", None)
         return None if tau is None else tau.abs().clone()
 
-    def pushing_hard(self) -> torch.Tensor:
+    def pushing_hard(self, name: str | None = None) -> torch.Tensor:
         """(n,) bool: some arm joint carries more than `push_ratio` of its rating ON TOP of the load
-        it had before the held part reached the case."""
+        it had before the held part reached the case. With `name`, only the arm nearest that part
+        counts (a second arm resting or braced elsewhere is not "shoving")."""
         import torch
 
         hard = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.gate_closed.device)
-        for g, base in zip(self._arms, self._tau_base):
+        pos = None if name is None else _obj(self.env, name).data.root_pos_w
+        doing = (torch.ones(self.env.num_envs, len(self._arms), dtype=torch.bool) if pos is None
+                 else arm_nearest(self.env, self._arms, pos))
+        for i, (g, base) in enumerate(zip(self._arms, self._tau_base)):
             tau = self._abs_tau(g)
             if tau is None or base is None:
                 continue
             extra = torch.where(g.grip, torch.zeros_like(tau), (tau - base) / g.rated_eff)
-            hard |= (extra > self.push_ratio).any(dim=1).to(hard.device)
+            hard |= ((extra > self.push_ratio).any(dim=1) & doing[:, i].to(tau.device)).to(hard.device)
         return hard
 
     def part_held(self, name: str) -> torch.Tensor:
@@ -301,9 +305,9 @@ class SlotInsertPrevention(CarryPrevention):
             tau = self._abs_tau(g)
             if tau is not None:
                 self._tau_base[i] = torch.where((~busy).to(tau.device)[:, None], tau, self._tau_base[i])
-        hard = self.pushing_hard()
         shield = getattr(self.env, "safety", None)
         for k in self.parts:
+            hard = self.pushing_hard(k)  # the arm working this part
             allowed = self.cleared(k) & self.in_slot_tolerance(k).to(dev)
             self._excused[k] &= hard  # excused only until the push eases
             shove = working[k] & hard & ~allowed & ~self._excused[k]
@@ -391,7 +395,7 @@ class PressMonitor:
         self._window.append(d.clone())
         if len(self._window) == self._window.maxlen:
             progress = (self._window[-1] - self._window[0]).to(self.stalled.device)
-            self.stalled |= (progress < self.min_progress) & self.prev.pushing_hard()
+            self.stalled |= (progress < self.min_progress) & self.prev.pushing_hard(self.name)
 
     def close(self) -> None:
         remove_post_step(self.env, self._update)

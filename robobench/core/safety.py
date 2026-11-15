@@ -74,6 +74,16 @@ def ratings_from_urdf(path: str | Path) -> dict[str, JointRating]:
     return out
 
 
+
+def link_tree_from_urdf(path: str | Path) -> dict[str, str]:
+    """`{child link: parent link}` from the `<joint>` tags of a URDF (fixed joints included)."""
+    out: dict[str, str] = {}
+    for joint in ET.parse(path).getroot().iter("joint"):
+        par, ch = joint.find("parent"), joint.find("child")
+        if par is not None and ch is not None and par.get("link") and ch.get("link"):
+            out[ch.get("link")] = par.get("link")
+    return out
+
 _ROBOT_ASSETS = Path(__file__).resolve().parents[1] / "robots" / "assets"
 
 #: Robot class name -> the URDF in this repo whose `<limit>` tags carry its hardware ratings.
@@ -86,6 +96,12 @@ RATING_URDFS: dict[str, Path] = {
 }
 
 _RATINGS_CACHE: dict[str, dict[str, JointRating]] = {}
+
+
+def link_tree_for(robot_cls: str) -> dict[str, str]:
+    """`{child link: parent link}` for a robot class with a URDF in this repo ({} otherwise)."""
+    path = RATING_URDFS.get(robot_cls)
+    return link_tree_from_urdf(path) if path and path.exists() else {}
 
 
 def ratings_for(robot_cls: str) -> dict[str, JointRating]:
@@ -152,6 +168,28 @@ def console_approver(name: str, info: dict) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+
+# ----- backend-neutral data access ----------------------------------------------------------------
+class _TorchData:
+    """Torch view of an articulation's data. Isaac Lab (PhysX) data fields are torch tensors; the
+    Newton backend hands back warp arrays that carry a zero-copy `.torch` view. Reading through
+    this view lets the same clamp/compare/write code run on both (writes land in the sim buffer)."""
+
+    __slots__ = ("_d",)
+
+    def __init__(self, d: Any) -> None:
+        object.__setattr__(self, "_d", d)
+
+    def __getattr__(self, name: str) -> Any:
+        x = getattr(self._d, name)  # AttributeError passes through, so getattr(..., default) works
+        return getattr(x, "torch", x)
+
+
+def tdata(art: Any) -> _TorchData:
+    """`art.data` with every field as a torch tensor (PhysX or Newton)."""
+    d = art.data
+    return d if isinstance(d, _TorchData) else _TorchData(d)
+
 # ----- per-articulation guard ---------------------------------------------------------------------
 class _ArmGuard:
     """Limits, command filter and measurements for one robot articulation."""
@@ -161,7 +199,7 @@ class _ArmGuard:
         import torch
 
         self.name, self.art, self.limits = name, art, limits
-        d = art.data
+        d = tdata(art)
         dev = d.joint_pos.device
         self.joint_names = list(art.joint_names)
         rated = ratings_for(robot_cls)
@@ -242,13 +280,18 @@ class _ArmGuard:
             self.close_sign = torch.where(ok, sgn, self.close_sign)
         self.q_hold = d.joint_pos.detach().clone()
 
+    @property
+    def data(self) -> _TorchData:
+        """This articulation's data as torch tensors (see `tdata`)."""
+        return tdata(self.art)
+
     # -- enforce --------------------------------------------------------------------------------
     def filter(self, tripped: torch.Tensor) -> None:
         """Clamp this substep's commands in place (after the controller wrote them, before physics
         reads them), and hold tripped envs with a braking PD."""
         import torch
 
-        d = self.art.data
+        d = tdata(self.art)
         d.joint_pos_target.copy_(torch.clamp(d.joint_pos_target, self.lo_cmd, self.hi_cmd))
         d.joint_vel_target.copy_(torch.clamp(d.joint_vel_target, -self.vel_max, self.vel_max))
         d.joint_effort_target.copy_(torch.clamp(d.joint_effort_target, -self.eff_max, self.eff_max))
@@ -264,13 +307,13 @@ class _ArmGuard:
 
     def latch(self, new: torch.Tensor) -> None:
         """Freeze the hold pose for newly tripped envs."""
-        self.q_hold[new] = self.art.data.joint_pos[new]
+        self.q_hold[new] = tdata(self.art).joint_pos[new]
 
     def write_sim_limits(self) -> list[str]:
         """Write rated limits into the physics engine (never raising an existing limit)."""
         import torch
 
-        art, d, done = self.art, self.art.data, []
+        art, d, done = self.art, tdata(self.art), []
         if hasattr(art, "write_joint_effort_limit_to_sim"):
             cur = d.joint_effort_limits
             art.write_joint_effort_limit_to_sim(torch.minimum(cur, self.eff_max.expand_as(cur)).clone())
@@ -286,7 +329,7 @@ class _ArmGuard:
         """`{kind: (violation (n,) bool, peak ratio/value (n,), worst-joint index (n,) or None)}`."""
         import torch
 
-        d = self.art.data
+        d = tdata(self.art)
         out: dict[str, tuple] = {}
         ratio = d.joint_vel.abs() / self.vel_max
         out["joint_speed"] = self._summarize(ratio, ratio > tol)
@@ -475,7 +518,7 @@ class SafetyShield:
                 add(kind, mask, peak, why)
 
         if self.objects:
-            vz = torch.stack([o.data.root_lin_vel_w[:, 2] for o in self.objects.values()], dim=1)
+            vz = torch.stack([tdata(o).root_lin_vel_w[:, 2] for o in self.objects.values()], dim=1)
             if self._prev_vz is not None:
                 falling = (-self._prev_vz).clamp_min(0.0)
                 stopped = (vz - self._prev_vz) > 0.5 * falling
@@ -492,7 +535,7 @@ class SafetyShield:
 
         if self.fixtures:
             lim = self.rules.fixture_speed_max
-            speeds = torch.stack([a.data.joint_vel.abs().max(dim=1).values
+            speeds = torch.stack([tdata(a).joint_vel.abs().max(dim=1).values
                                   for a in self.fixtures.values()], dim=1)
             peak, worst = speeds.max(dim=1)
             keys = list(self.fixtures)

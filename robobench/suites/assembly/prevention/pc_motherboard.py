@@ -71,7 +71,7 @@ from typing import TYPE_CHECKING
 
 from robobench.core.prevention import (CarryPrevention, add_post_step, quat_rotate, quat_rotate_inverse,
                                        remove_post_step, required_grip_force, verify_then_approve,
-                                       _guards, _obj)
+                                       _guards, _obj, arm_nearest)
 
 if TYPE_CHECKING:
     import torch
@@ -319,20 +319,22 @@ class PcMotherboardPrevention(CarryPrevention):
     # -- 4. watchdog ------------------------------------------------------------------------------
     @staticmethod
     def _abs_tau(g):
-        tau = getattr(g.art.data, "applied_torque", None)
+        tau = getattr(g.data, "applied_torque", None)
         return None if tau is None else tau.abs().clone()
 
     def pushing_hard(self) -> torch.Tensor:
-        """(n,) bool: torque added since the key reached the board exceeds `push_ratio` of a rating."""
+        """(n,) bool: torque added since the key reached the board exceeds `push_ratio` of a rating,
+        on the arm holding the key (the arm nearest it; an idle second arm does not count)."""
         import torch
 
         hard = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.gate_closed.device)
-        for g, base in zip(self._arms, self._tau_base):
+        doing = arm_nearest(self.env, self._arms, _obj(self.env, "key").data.root_pos_w)
+        for i, (g, base) in enumerate(zip(self._arms, self._tau_base)):
             tau = self._abs_tau(g)
             if tau is None or base is None:
                 continue
             extra = torch.where(g.grip, torch.zeros_like(tau), (tau - base) / g.rated_eff)
-            hard |= (extra > self.push_ratio).any(dim=1).to(hard.device)
+            hard |= ((extra > self.push_ratio).any(dim=1) & doing[:, i].to(tau.device)).to(hard.device)
         return hard
 
     def key_near_board(self) -> torch.Tensor:

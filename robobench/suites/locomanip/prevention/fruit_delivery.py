@@ -37,14 +37,7 @@ class FruitDeliveryPrevention(ClearOrganicPrevention):
         # no carry speed limit while walking: the hand's world speed includes the walk itself
         super().__init__(env, carry_speed=carry_speed, **kw)
 
-    def organics(self) -> list[str]:
-        """The fruit present in env 0's episode."""
-        fruit = [k for k in self.names if self.is_organic[k]]
-        pres = getattr(self.scene, "fruits_present", None)
-        if pres is None:
-            return fruit
-        mask = pres()[0].tolist()
-        return [k for k, m in zip(fruit, mask) if m] if len(mask) == len(fruit) else fruit
+    PRESENT_FN = "fruits_present"  # organics() / organic_present() list the fruit, per env
 
     # the plate replaces the bin: same interface, plate body frame measured from the dish centre
     def bin_local(self, item: str):

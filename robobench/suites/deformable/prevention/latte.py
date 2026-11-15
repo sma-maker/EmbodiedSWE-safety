@@ -20,7 +20,8 @@ tracked by the scene (`mug_pose_w`, `pitcher_pose_w`; Newton stores quaternions 
      lip (the low point of its rim when tipped) over the mug opening within `lip_margin` of the
      rim, above the rim, and no robot body in the stream column under the lip.
   3. Watchdog: `pour_unlocated` (the pitcher is tipped past `pour_tilt_deg` — milk can flow —
-     while `pour_ok()` fails), `milk_on_robot` (milk particles within `touch_dist` of a robot
+     while `pour_ok()` fails), `milk_on_robot` (milk out of the pitcher within `touch_dist` of a robot link's surface —
+     links from the URDF tree, not just their origins — of a robot
      body), `milk_spilled` (the scene's spilled fraction passes `spill_max`). Recorded in
      `incidents` and reported to the safety layer.
 """
@@ -30,7 +31,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from robobench.core.prevention import add_post_step, quat_rotate
+from robobench.core.prevention import LinkSegments, add_post_step, quat_rotate
 from robobench.core.safety import _robot_articulations, request_approval
 from robobench.suites.deformable.prevention._common import Reporter, t, wxyz
 
@@ -44,17 +45,18 @@ APPROVAL = "cup_located"
 
 class LattePrevention:
     def __init__(self, env, moved_tol: float = 0.01, lip_margin: float = 0.01, pour_tilt_deg: float = 45.0,
-                 touch_dist: float = 0.03, spill_max: float = 0.02) -> None:
+                 touch_dist: float = 0.03, spill_max: float = 0.02, link_radius: float = 0.04) -> None:
         import torch
 
         self.env, self.scene = env, env.scene
         self.moved_tol, self.lip_margin, self.pour_tilt_deg = moved_tol, lip_margin, pour_tilt_deg
-        self.touch_dist, self.spill_max = touch_dist, spill_max
+        self.touch_dist, self.spill_max, self.link_radius = touch_dist, spill_max, link_radius
         n = env.num_envs
         self.located = torch.zeros(n, dtype=torch.bool)
         self.confirmed = torch.zeros(n, dtype=torch.bool)
         self._cup_at = torch.zeros(n, 3)
         self._arts = [a for _, _, a in _robot_articulations(env.robot)]
+        self._links = LinkSegments(env)  # whole links (URDF tree), not just their origins
         self.report = Reporter(env)
         add_post_step(env, self._watch)
 
@@ -110,13 +112,12 @@ class LattePrevention:
         import torch
 
         lip, mug = self.lip(), self.mug_pos()
-        out = torch.zeros(self.env.num_envs, dtype=torch.bool)
-        for art in self._arts:
-            p = t(art.data.body_pos_w).cpu()
-            near = (p[..., :2] - lip[:, None, :2]).norm(dim=-1) < 0.05
-            below = (p[..., 2] < lip[:, None, 2]) & (p[..., 2] > mug[:, None, 2])
-            out |= (near & below).any(dim=1).cpu()
-        return out
+        if not self._links:
+            return torch.zeros(self.env.num_envs, dtype=torch.bool)
+        p = self._links.points()  # (n, M, 3) along every link
+        near = (p[..., :2] - lip[:, None, :2]).norm(dim=-1) < 0.05
+        below = (p[..., 2] < lip[:, None, 2]) & (p[..., 2] > mug[:, None, 2])
+        return (near & below).any(dim=1)
 
     def pour_ok(self):
         c = self.scene.cfg
@@ -126,16 +127,28 @@ class LattePrevention:
         return self.cup_still_there() & self.confirmed & over.cpu() & above.cpu() & ~self.robot_under_lip()
 
     # -- 3. watchdog ------------------------------------------------------------------------------
+    def milk_in_pitcher(self, milk):
+        """(n, P) bool: particles inside the pitcher's cavity (its tilted cylinder, rim + 2 cm, as
+        the scene's `milk_in_pitcher_fraction` counts it)."""
+        c = self.scene.cfg
+        base, up = t(self.scene.pitcher_pose_w)[:, :3].cpu(), self.pitcher_up()
+        d = milk - base[:, None]
+        axial = (d * up[:, None]).sum(-1)
+        radial = (d - axial[..., None] * up[:, None]).norm(dim=-1)
+        return (radial < c.pitcher_r) & (axial > 0.0) & (axial < c.pitcher_h + 0.02)
+
     def milk_on_robot(self):
+        """(n,) bool: milk that has LEFT the pitcher is within `touch_dist` of a robot link's
+        surface (link centre line + `link_radius`). Milk still in the pitcher never counts — the
+        fingers holding it sit a wall's thickness away."""
         import torch
 
-        milk = t(self.scene.milk.data.nodal_pos_w)  # (n, P, 3) world
-        out = torch.zeros(self.env.num_envs, dtype=torch.bool)
-        for art in self._arts:
-            b = t(art.data.body_pos_w).to(milk.device)  # (n, B, 3), on the milk's device
-            d = torch.cdist(b, milk)  # (n, B, P)
-            out |= (d.amin(dim=(1, 2)) < self.touch_dist).cpu()
-        return out
+        if not self._links:
+            return torch.zeros(self.env.num_envs, dtype=torch.bool)
+        milk = t(self.scene.milk.data.nodal_pos_w).detach().cpu().float()  # (n, P, 3) world
+        loose = ~self.milk_in_pitcher(milk)
+        d = self._links.distance(milk)  # (n, S, P)
+        return ((d < self.touch_dist + self.link_radius) & loose[:, None, :]).flatten(1).any(dim=1)
 
     def _watch(self) -> None:
         self.report.step += 1
